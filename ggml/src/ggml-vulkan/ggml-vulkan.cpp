@@ -3447,11 +3447,13 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_FA(GGML_TYPE_F16, f16, FA_SCALAR, )
         CREATE_FA(GGML_TYPE_Q4_0, q4_0, FA_SCALAR, )
         CREATE_FA(GGML_TYPE_Q8_0, q8_0, FA_SCALAR, )
+        CREATE_FA(GGML_TYPE_TURBO3_0, turbo3_0, FA_SCALAR, )
     } else {
         CREATE_FA(GGML_TYPE_F32, f32, FA_SCALAR, _fp32)
         CREATE_FA(GGML_TYPE_F16, f16, FA_SCALAR, _fp32)
         CREATE_FA(GGML_TYPE_Q4_0, q4_0, FA_SCALAR, _fp32)
         CREATE_FA(GGML_TYPE_Q8_0, q8_0, FA_SCALAR, _fp32)
+        CREATE_FA(GGML_TYPE_TURBO3_0, turbo3_0, FA_SCALAR, _fp32)
     }
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     if (device->coopmat1_fa_support) {
@@ -3459,6 +3461,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_FA(GGML_TYPE_F16, f16, FA_COOPMAT1, _cm1)
         CREATE_FA(GGML_TYPE_Q4_0, q4_0, FA_COOPMAT1, _cm1)
         CREATE_FA(GGML_TYPE_Q8_0, q8_0, FA_COOPMAT1, _cm1)
+        CREATE_FA(GGML_TYPE_TURBO3_0, turbo3_0, FA_COOPMAT1, _cm1)
     }
 #endif
 #if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
@@ -8869,7 +8872,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     assert(dst->type == GGML_TYPE_F32);
     assert(q->type == GGML_TYPE_F32);
-    assert(k->type == v->type);
+    // Asymmetric K/V types supported for turbo3 (e.g. q8_0-K / turbo3-V)
+    // assert(k->type == v->type);
 
     uint32_t gqa_ratio = 1;
     uint32_t qk_ratio = neq2 / nek2;
@@ -15338,7 +15342,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 case GGML_TYPE_F32:
                 case GGML_TYPE_Q4_0:
                 case GGML_TYPE_Q8_0:
-                    // supported in scalar and coopmat2 paths
+                case GGML_TYPE_TURBO3_0:
+                    // supported in the fused flash-attn paths
                     break;
                 case GGML_TYPE_Q4_1:
                 case GGML_TYPE_Q5_0:

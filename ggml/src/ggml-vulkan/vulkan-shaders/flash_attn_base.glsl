@@ -149,6 +149,65 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
 }
 #endif
 
+#if defined(DATA_A_TURBO3_0) && defined(FLASH_ATTN_DIRECT_TURBO3)
+#define BLOCK_BYTE_SIZE 14
+layout (binding = 1) readonly buffer KQ {block_turbo3_0 data_kq[];};
+layout (binding = 2) readonly buffer VQ {block_turbo3_0 data_vq[];};
+
+// Lloyd-Max 3-bit centroids (8 levels, symmetric)
+const FLOAT_TYPE turbo3_centroids[8] = FLOAT_TYPE[8](
+    FLOAT_TYPE(-0.190685), FLOAT_TYPE(-0.117832), FLOAT_TYPE(-0.065717), FLOAT_TYPE(-0.021460),
+    FLOAT_TYPE( 0.021460), FLOAT_TYPE( 0.065717), FLOAT_TYPE( 0.117832), FLOAT_TYPE( 0.190685)
+);
+
+FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    // iqs is the element offset within the block (0..28 in steps of 4)
+    // Each byte of qs holds 4 2-bit indices, each byte of signs holds 8 1-bit flags
+    const uint byte_idx = iqs / 4;  // which qs byte (0..7)
+    const uint bit_off  = (iqs % 4) * 2;  // bit offset within qs byte
+    const uint sign_byte = iqs / 8;  // which signs byte (0..3)
+    const uint sign_off  = iqs % 8;  // bit offset within signs byte
+
+    uint qs_val, signs_val;
+    FLOAT_TYPE norm;
+
+    if (binding_idx == BINDING_IDX_K) {
+        qs_val    = uint(data_kq[a_offset + ib].qs[byte_idx]);
+        signs_val = uint(data_kq[a_offset + ib].signs[sign_byte]);
+        norm      = FLOAT_TYPE(data_kq[a_offset + ib].norm);
+    } else {
+        qs_val    = uint(data_vq[a_offset + ib].qs[byte_idx]);
+        signs_val = uint(data_vq[a_offset + ib].signs[sign_byte]);
+        norm      = FLOAT_TYPE(data_vq[a_offset + ib].norm);
+    }
+
+    // Extract 4 consecutive 3-bit indices: low2 from qs, hi1 from signs
+    const uint idx0 = ((qs_val >> (bit_off    )) & 0x3) | (((signs_val >> (sign_off    )) & 0x1) << 2);
+    const uint idx1 = ((qs_val >> (bit_off + 2)) & 0x3) | (((signs_val >> (sign_off + 1)) & 0x1) << 2);
+    // Next 2 elements may cross byte boundaries
+    const uint byte_idx2 = (iqs + 2) / 4;
+    const uint bit_off2  = ((iqs + 2) % 4) * 2;
+    const uint sign_off2 = (iqs + 2) % 8;
+
+    uint qs_val2;
+    if (byte_idx2 != byte_idx) {
+        if (binding_idx == BINDING_IDX_K) {
+            qs_val2 = uint(data_kq[a_offset + ib].qs[byte_idx2]);
+        } else {
+            qs_val2 = uint(data_vq[a_offset + ib].qs[byte_idx2]);
+        }
+    } else {
+        qs_val2 = qs_val;
+    }
+
+    const uint idx2 = ((qs_val2 >> (bit_off2    )) & 0x3) | (((signs_val >> (sign_off2    )) & 0x1) << 2);
+    const uint idx3 = ((qs_val2 >> (bit_off2 + 2)) & 0x3) | (((signs_val >> (sign_off2 + 1)) & 0x1) << 2);
+
+    return norm * FLOAT_TYPEV4(turbo3_centroids[idx0], turbo3_centroids[idx1],
+                                turbo3_centroids[idx2], turbo3_centroids[idx3]);
+}
+#endif
+
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 
 
