@@ -19,7 +19,10 @@ void main() {
     const uint ib  = gl_WorkGroupID.x;
     const uint j   = gl_LocalInvocationID.x;  // element index 0..127
 
-    if (ib >= p.nel / 128) return;
+    // Round up so non-aligned nel (not a multiple of 128) still processes the
+    // final partial block. Truncating (nel / 128) would skip the last block
+    // and leave a tensor with stale tail values.
+    if (ib >= (p.nel + 127u) / 128u) return;
 
     const float norm = float(data_a[ib].norm);
 
