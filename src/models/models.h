@@ -190,6 +190,10 @@ struct llm_build_deepseek2 : public llm_graph_context {
     llm_build_deepseek2(const llama_model & model, const llm_graph_params & params);
 };
 
+struct llm_build_instella_moe : public llm_graph_context {
+    llm_build_instella_moe(const llama_model & model, const llm_graph_params & params);
+};
+
 struct llm_build_deepseek : public llm_graph_context {
     llm_build_deepseek(const llama_model & model, const llm_graph_params & params);
 };

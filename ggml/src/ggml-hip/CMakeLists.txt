@@ -62,8 +62,9 @@ list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
-# Exclude D>=576 tile kernels: exceed HIP local memory limit (67584 > 65536)
-list(FILTER SRCS EXCLUDE REGEX "dkq(576|640)")
+# D=576/640 (MLA turbo pads: GLM K=576, Instella K=544 → 640) ship for HIP.
+# Shared-mem overshoot was ncols=32 + nbatch_fa=128 (67584 B); launch path now
+# caps those heads at cols_per_block<=16 on HIP and RDNA configs use nbatch_fa=64.
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})

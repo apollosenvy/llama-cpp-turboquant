@@ -42,8 +42,10 @@ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor 
             GGML_ASSERT(V->ne[0] == K->ne[0]);
             ggml_cuda_flash_attn_ext_tile_case<512, 512>(ctx, dst);
         } break;
-#ifndef GGML_USE_HIP
-        // D>=576 tile kernels exceed HIP local memory limit (67584 > 65536)
+        // MLA + turbo zero-pad: DeepSeek/GLM K=576→640, Instella K=544→640, V stays 512.
+        // HIP/RDNA: these were gated off because RDNA config (ncols=32, nbatch_fa=128, DKQ=640)
+        // declares 67584 B shared (> 64 KiB LDS). launch_fattn_tile_switch_ncols1 caps
+        // cols_per_block at 16 on HIP when DKQ>=576 so peak LDS is ~31 KiB. CUDA keeps full width.
         case 576: {
             GGML_ASSERT(V->ne[0] == 512);
             ggml_cuda_flash_attn_ext_tile_case<576, 512>(ctx, dst);
@@ -52,7 +54,6 @@ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor 
             GGML_ASSERT(V->ne[0] == 512);
             ggml_cuda_flash_attn_ext_tile_case<640, 512>(ctx, dst);
         } break;
-#endif
         default: {
             GGML_ABORT("Unsupported head size");
         } break;

@@ -208,15 +208,19 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512, 16, 256, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512, 32, 512, 1, 128,  64)
 
+    // ncols=2: required by launch path when ncols2=1 (no-mask / no GQA-opt graphs)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  2,  64, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  4, 128, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  8, 256, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 16, 256, 2,  64,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 32, 512, 1, 128,  64)
+    // nbatch_fa=64 keeps FP16 shared under 64 KiB LDS (was 128 → 67.5 KiB at ncols=32)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 32, 512, 1,  64,  64)
 
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512,  2,  64, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512,  4, 128, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512,  8, 256, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512, 16, 256, 2,  64,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512, 32, 512, 1, 128,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512, 32, 512, 1,  64,  64)
 
     return 0;
 }
@@ -282,15 +286,20 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512, 16, 256, 4,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512, 32, 256, 2, 128,  64)
 
+    // ncols=2: decode without GQA opt falls through to cols_per_block=2
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  2,  64, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  4, 128, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  8, 256, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 16, 256, 4,  64,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 32, 256, 2, 128,  64)
+    // nbatch_fa=64 not 128: 32-col * DKQ=576 still fine; keep consistent with 640
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 32, 256, 2,  64,  64)
 
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512,  2,  64, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512,  4, 128, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512,  8, 256, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512, 16, 256, 4,  64,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512, 32, 256, 2, 128,  64)
+    // nbatch_fa=64 (not 128): ncols=32 * DKQ=640 FP16 shared was 67584 B (>64 KiB LDS)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(640, 512, 32, 256, 2,  64,  64)
 
     return 0;
 }
@@ -1145,12 +1154,11 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             return;
         }
     }
-#endif // GGML_USE_HIP
-
-#ifndef GGML_USE_HIP
-    if constexpr (DV <= 256)
-#endif // GGML_USE_HIP
-    {
+    // RDNA LDS is 64 KiB. For MLA turbo pads (DKQ 576/640, DV 512) the RDNA
+    // config (ncols=32, nbatch_fa=128) needs 67584 B shared — overshoot that
+    // previously forced us to disable these heads entirely. Cap at 16 columns
+    // so shared stays ~31 KiB (ncols=16, nbatch_fa=64). Smaller heads keep 32.
+    if constexpr (DKQ <= 512) {
         if (Q->ne[1] > 16/ncols2) {
             constexpr int cols_per_block = 32;
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
@@ -1161,6 +1169,19 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             return;
         }
     }
+#else
+    if constexpr (DV <= 256) {
+        if (Q->ne[1] > 16/ncols2) {
+            constexpr int cols_per_block = 32;
+            const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+            const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
+            launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, warp_size);
+            return;
+        }
+    }
+#endif // GGML_USE_HIP
 
     if (Q->ne[1] > 8/ncols2) {
         constexpr int cols_per_block = 16;
@@ -1228,7 +1249,10 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
     const int gqa_limit = nvidia && gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
     const bool use_gqa_opt = mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
-    if constexpr (DKQ == 576) {
+    // MLA turbo pads (GLM K=576, Instella K=544→640). Prefer GQA-opt when available
+    // (MQA after MLA absorption is gqa_ratio=16). Fall back to ncols2=1 so load probes
+    // and no-mask graphs still run — RDNA configs include ncols=2/4/8/16 for these heads.
+    if constexpr (DKQ == 576 || DKQ == 640) {
         if (use_gqa_opt && gqa_ratio % 16 == 0) {
             launch_fattn_tile_switch_ncols1<DKQ, DV, 16, use_logit_softcap>(ctx, dst);
             return;
@@ -1237,6 +1261,8 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
             launch_fattn_tile_switch_ncols1<DKQ, DV, 4, use_logit_softcap>(ctx, dst);
             return;
         }
+        launch_fattn_tile_switch_ncols1<DKQ, DV, 1, use_logit_softcap>(ctx, dst);
+        return;
     }
 
     if constexpr (DKQ <= 512) {
