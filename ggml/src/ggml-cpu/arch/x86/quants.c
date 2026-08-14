@@ -932,7 +932,45 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     int ib = 0;
     float sumf = 0;
 
-#if defined __AVX2__
+#if defined __AVX512VNNI__ && defined __AVX512VBMI__ && defined __AVX512F__
+
+    // 512-bit path: 2 blocks (64 weights) per iteration.
+    // vpermb does the whole 16-entry e2m1 LUT in one op. The LUT is shifted
+    // to unsigned (+12, range 0..24) so vpdpbusd (u8 x s8) applies:
+    //     dot = dpbusd(w+12, y) - 12 * dpbusd(1, y)
+    // dpbusd lane l covers bytes 4l..4l+3, so i32 lanes 0-7 belong to block
+    // ib and 8-15 to block ib+1; per-block scales ride in the matching fp32
+    // lane halves and block dots stay exact.
+    const __m512i lut_u = _mm512_broadcast_i32x4(
+        _mm_add_epi8(_mm_loadu_si128((const __m128i*)kvalues_mxfp4), _mm_set1_epi8(12)));
+    const __m128i m4b_512 = _mm_set1_epi8(0x0f);
+    const __m512i ones8 = _mm512_set1_epi8(1);
+    const __m512i twelve = _mm512_set1_epi32(12);
+    __m512 acc512 = _mm512_setzero_ps();
+
+    for (; ib + 1 < nb; ib += 2) {
+        const __m128i qb0 = _mm_loadu_si128((const __m128i*)x[ib + 0].qs);
+        const __m128i qb1 = _mm_loadu_si128((const __m128i*)x[ib + 1].qs);
+        __m512i nib = _mm512_castsi128_si512(_mm_and_si128(qb0, m4b_512));
+        nib = _mm512_inserti32x4(nib, _mm_and_si128(_mm_srli_epi16(qb0, 4), m4b_512), 1);
+        nib = _mm512_inserti32x4(nib, _mm_and_si128(qb1, m4b_512), 2);
+        nib = _mm512_inserti32x4(nib, _mm_and_si128(_mm_srli_epi16(qb1, 4), m4b_512), 3);
+        const __m512i wu = _mm512_permutexvar_epi8(nib, lut_u);
+        __m512i yv = _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i*)y[ib + 0].qs));
+        yv = _mm512_inserti64x4(yv, _mm256_loadu_si256((const __m256i*)y[ib + 1].qs), 1);
+        const __m512i dp   = _mm512_dpbusd_epi32(_mm512_setzero_si512(), wu, yv);
+        const __m512i sumy = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones8, yv);
+        const __m512i di   = _mm512_sub_epi32(dp, _mm512_mullo_epi32(sumy, twelve));
+        const float s0 = GGML_CPU_FP16_TO_FP32(y[ib + 0].d)*GGML_CPU_E8M0_TO_FP32_HALF(x[ib + 0].e);
+        const float s1 = GGML_CPU_FP16_TO_FP32(y[ib + 1].d)*GGML_CPU_E8M0_TO_FP32_HALF(x[ib + 1].e);
+        const __m512 sv = _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_set1_ps(s0)),
+                                             _mm256_set1_ps(s1), 1);
+        acc512 = _mm512_fmadd_ps(sv, _mm512_cvtepi32_ps(di), acc512);
+    }
+
+    sumf = _mm512_reduce_add_ps(acc512);
+
+#elif defined __AVX2__
 
     const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_mxfp4);
     const __m128i m4b  = _mm_set1_epi8(0x0f);
