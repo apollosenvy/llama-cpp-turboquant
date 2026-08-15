@@ -5057,8 +5057,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
-                    case GGML_TYPE_TQ4_1S:
-                    case GGML_TYPE_TQ3_1S:
+                    // fork: TQ types intentionally NOT get_rows-supported on CUDA;
+                    // no kernel exists (never did), supports_op=false -> graceful skip
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
                     case GGML_TYPE_Q4_K:
