@@ -185,3 +185,20 @@ llm_build_instella_moe::llm_build_instella_moe(const llama_model & model, const 
 
     ggml_build_forward_expand(gf, cur);
 }
+
+
+void llama_model_instella_moe::load_arch_tensors(llama_model_loader & ml) {
+    llama_model_deepseek2::load_arch_tensors(ml);
+
+    // [TAG_INSTELLA_GATED_ATTN] learned gate before o_proj (fork)
+    const int64_t n_embd            = hparams.n_embd;
+    const int64_t n_head            = hparams.n_head();
+    const int64_t n_embd_head_v_mla = hparams.n_embd_head_v_mla();
+    for (int i = 0; i < (int) hparams.n_layer; ++i) {
+        layers[i].wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_head * n_embd_head_v_mla}, 0);
+    }
+}
+
+std::unique_ptr<llm_graph_context> llama_model_instella_moe::build_arch_graph(const llm_graph_params & params) const {
+    return std::make_unique<llm_build_instella_moe>(*this, params);
+}
