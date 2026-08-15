@@ -11067,6 +11067,9 @@ static void ggml_compute_forward_turbo_wht_f32(
         for (int64_t h = 0; h < n_heads; h++) {
             const int64_t base = h * head_dim + tail_offset;
             memcpy(dst_data + base, src_data + base, tail_size * sizeof(float));
+        }
+    }
+}
 
 // ggml_compute_forward_dsv4_hc_comb
 
@@ -11092,6 +11095,9 @@ void ggml_compute_forward_turbo_wht(
     switch (dst->src[0]->type) {
         case GGML_TYPE_F32: ggml_compute_forward_turbo_wht_f32(params, dst); break;
         default: GGML_ABORT("fatal error");
+    }
+}
+
 static void ggml_dsv4_hc_comb_norm_rows(float * comb, float eps) {
     constexpr int64_t hc = 4;
 

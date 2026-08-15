@@ -1878,7 +1878,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 
     // fork: TQ weight types (TQ3_1S/TQ4_1S) use the fused dp4a path, never mmvq/mmq.
-    if ((src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S) && !split) {
+    if (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S) {
         if (src1->ne[1] <= MMVQ_MAX_BATCH_SIZE) {
             // Fused TQ mul_mat with pre-rotated activations via warp-shuffle WHT
             ggml_cuda_mul_mat_tq(ctx, src0, src1, dst);
@@ -1889,7 +1889,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             ggml_cuda_mul_mat_tq4_1s_cublas(ctx, src0, src1, dst);
             return;
         }
-        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
+        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
 

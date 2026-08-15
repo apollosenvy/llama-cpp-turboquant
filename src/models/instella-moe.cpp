@@ -194,7 +194,7 @@ void llama_model_instella_moe::load_arch_tensors(llama_model_loader & ml) {
     const int64_t n_embd            = hparams.n_embd;
     const int64_t n_head            = hparams.n_head();
     const int64_t n_embd_head_v_mla = hparams.n_embd_head_v_mla();
-    for (int i = 0; i < (int) hparams.n_layer; ++i) {
+    for (int i = 0; i < (int) hparams.n_layer(); ++i) {
         layers[i].wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_head * n_embd_head_v_mla}, 0);
     }
 }

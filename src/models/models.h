@@ -399,6 +399,8 @@ struct llama_model_clip : public llama_model_base {
 
     [[noreturn]]
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
 struct llm_build_instella_moe : public llm_graph_context {
     llm_build_instella_moe(const llama_model & model, const llm_graph_params & params);
 };

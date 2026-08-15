@@ -450,6 +450,7 @@ static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const i
         y[j+ 0] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] & 0xf]*0.5f);
         y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] >>  4]*0.5f);
     }
+}
 
 // Turbo4: 4-bit PolarQuant (nibble packed), block size 128
 // iqs is the element index within the block (even), produces elements iqs and iqs+1
