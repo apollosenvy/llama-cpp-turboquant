@@ -774,6 +774,23 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
             csa_k->nb[1], csa_k->nb[2], csa_k->nb[3], 0);
     cb(csa_k, "csa_comp_k", il);
 
+    // TurboQuant basis rule: every K source here stores rows WHT-rotated
+    // (the raw AND compressed caches are all llama_kv_cache instances with
+    // the same turbo type; their cpy_k quantizes in rotated space), but this
+    // path calls build_attn_mha directly, bypassing the build_attn overloads
+    // that rotate Q for turbo caches. Rotate Q into the cache basis; the
+    // output inverse WHT inside build_attn_mha (gated on V type) restores
+    // the result. Without this the KQ dot mixes bases and the model emits
+    // noise (KLD ~11 vs f16, top-token agreement 0.1%).
+    const bool k_is_turbo = raw_k->type == GGML_TYPE_TURBO3_0 ||
+                            raw_k->type == GGML_TYPE_TURBO4_0 ||
+                            raw_k->type == GGML_TYPE_TURBO2_0;
+    if (k_is_turbo) {
+        if (q->type != GGML_TYPE_F32) { q = ggml_cast(ctx0, q, GGML_TYPE_F32); }
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        q = ggml_turbo_wht(ctx0, q, 0, 0, nullptr);
+    }
+
     ggml_tensor * k_all = ggml_concat(ctx0, raw_k, csa_k, 2);
     cb(k_all, "csa_k_all", il);
 
@@ -829,6 +846,16 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
             hca_k->nb[1], hca_k->nb[2], hca_k->nb[3], 0);
     cb(hca_k, "hca_comp_k", il);
 
+    // TurboQuant basis rule — see build_csa_lid_attention.
+    const bool k_is_turbo = raw_k->type == GGML_TYPE_TURBO3_0 ||
+                            raw_k->type == GGML_TYPE_TURBO4_0 ||
+                            raw_k->type == GGML_TYPE_TURBO2_0;
+    if (k_is_turbo) {
+        if (q->type != GGML_TYPE_F32) { q = ggml_cast(ctx0, q, GGML_TYPE_F32); }
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        q = ggml_turbo_wht(ctx0, q, 0, 0, nullptr);
+    }
+
     ggml_tensor * k_all = ggml_concat(ctx0, raw_k, hca_k, 2);
     cb(k_all, "hca_k_all", il);
 
@@ -873,6 +900,13 @@ ggml_tensor * llama_model_deepseek4::graph::build_raw_attention(
     ggml_tensor * kq_mask = inp_attn->get_kq_mask();
 
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+
+    // TurboQuant basis rule — see build_csa_lid_attention.
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+        if (q->type != GGML_TYPE_F32) { q = ggml_cast(ctx0, q, GGML_TYPE_F32); }
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        q = ggml_turbo_wht(ctx0, q, 0, 0, nullptr);
+    }
 
     ggml_tensor * out = build_attn_mha(q, k, k, nullptr, kq_mask, sinks, nullptr, kq_scale, il);
     if (k_rot) {
