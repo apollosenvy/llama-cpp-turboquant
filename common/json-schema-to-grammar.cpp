@@ -345,10 +345,70 @@ private:
         return string_join(rules, " | ");
     }
 
-    std::string _visit_pattern(const std::string & pattern, const std::string & name) {
-        if (!(pattern.front() == '^' && pattern.back() == '$')) {
-            _errors.push_back("Pattern must start with '^' and end with '$'");
-            return "";
+    std::string _visit_pattern(const std::string & pattern_in, const std::string & name) {
+        // fork: auto-anchor unanchored patterns instead of erroring. JSON-schema
+        // semantics treat `pattern` as a SEARCH (unanchored), so `p` accepts any
+        // string containing a match; `^.*p.*$` is the anchored equivalent. Real
+        // clients (MCP tools) ship unanchored patterns and a hard error turns
+        // every tool call into a 400.
+        std::string pattern = pattern_in;
+        if (pattern.empty()) {
+            pattern = "^.*$";
+        } else if (!(pattern.front() == '^' && pattern.back() == '$')) {
+            std::string core = pattern;
+            if (!core.empty() && core.front() == '^') {
+                core = core.substr(1);
+            } else if (core.rfind(".*", 0) != 0) {
+                core = ".*" + core;
+            }
+            const bool ends_dollar = !core.empty() && core.back() == '$' &&
+                (core.size() < 2 || core[core.size()-2] != '\\');
+            if (ends_dollar) {
+                core = core.substr(0, core.size()-1);
+            } else if (core.size() < 2 || core.compare(core.size()-2, 2, ".*") != 0) {
+                core = core + ".*";
+            }
+            pattern = "^" + core + "$";
+        }
+        // fork: expand perl-style escape classes, which the GBNF converter has
+        // never understood (raw \S in the emitted grammar fails to parse).
+        // Outside a [...] class the shorthand becomes a full class; inside one
+        // it becomes the bracketless body. Negated shorthands inside a class
+        // cannot be composed and fall back to a permissive '.' / class-any.
+        {
+            auto expand = [](const std::string & in) {
+                std::string out;
+                bool in_class = false;
+                for (size_t i = 0; i < in.size(); ++i) {
+                    char c = in[i];
+                    if (c == '\\' && i + 1 < in.size()) {
+                        char e = in[i+1];
+                        std::string body, neg_body;
+                        switch (e) {
+                            case 'd': body = "0-9"; break;
+                            case 'w': body = "a-zA-Z0-9_"; break;
+                            case 's': body = " \\t\\n\\r"; break;
+                            case 'D': neg_body = "0-9"; break;
+                            case 'W': neg_body = "a-zA-Z0-9_"; break;
+                            case 'S': neg_body = " \\t\\n\\r"; break;
+                            default: out += c; out += e; ++i; continue;
+                        }
+                        if (!body.empty()) {
+                            out += in_class ? body : "[" + body + "]";
+                        } else {
+                            out += in_class ? std::string(".") /* unsupported in-class negation: permissive */
+                                            : "[^" + neg_body + "]";
+                        }
+                        ++i;
+                        continue;
+                    }
+                    if (c == '[' && (i == 0 || in[i-1] != '\\')) in_class = true;
+                    if (c == ']' && (i == 0 || in[i-1] != '\\')) in_class = false;
+                    out += c;
+                }
+                return out;
+            };
+            pattern = expand(pattern);
         }
         std::string sub_pattern = pattern.substr(1, pattern.length() - 2);
         std::unordered_map<std::string, std::string> sub_rule_ids;
