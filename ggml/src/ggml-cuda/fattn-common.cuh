@@ -1353,6 +1353,10 @@ void launch_fattn(
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
 
+    // NOTE on origin/master's hip_f16_alloc pool bypass (PR #92): not ported. The
+    // upstream sync moved these f16 temps out of the legacy pool entirely — they are
+    // carved from the graph allocation via ggml_cuda_flash_attn_ext_get_f16_extra_data,
+    // so the pool-retention leak that fix addressed cannot occur on this path.
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
 
