@@ -4,6 +4,8 @@
 #include "log.h"
 
 #include <cmath>
+#include <cstdlib>
+#include <map>
 #include <regex>
 #include <string>
 #include <vector>
@@ -179,6 +181,28 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
         auto n_bytes = ggml_nbytes(t);
         pimpl->data.resize(n_bytes);
         ggml_backend_tensor_get(t, pimpl->data.data(), 0, n_bytes);
+    }
+
+    // AEGIS (local patch): raw tensor dump for numeric debugging. Gated on
+    // COMMON_DEBUG_DUMP_DIR; combines with --tensor-filter for selection.
+    // Each occurrence writes <dir>/<name>.<seq>.bin: i64 ne[4] header + raw
+    // bytes. Contiguous non-quantized tensors only — views/permutes would
+    // need gather logic this debugging pass does not require.
+    if (matches_filter && !ggml_is_quantized(t->type) && ggml_is_contiguous(t)) {
+        const char * dump_dir = getenv("COMMON_DEBUG_DUMP_DIR");
+        if (dump_dir) {
+            static std::map<std::string, int> dump_seq;
+            char path[512];
+            snprintf(path, sizeof(path), "%s/%s.%d.bin", dump_dir, t->name, dump_seq[t->name]++);
+            FILE * fdump = fopen(path, "wb");
+            if (fdump) {
+                int64_t ne[4] = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };
+                fwrite(ne, sizeof ne, 1, fdump);
+                const uint8_t * raw = is_host ? (const uint8_t *) t->data : pimpl->data.data();
+                fwrite(raw, 1, ggml_nbytes(t), fdump);
+                fclose(fdump);
+            }
+        }
     }
 
     if (!ggml_is_quantized(t->type) && matches_filter) {
