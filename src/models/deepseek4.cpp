@@ -660,6 +660,22 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
             indexer_k->nb[1], indexer_k->nb[2], indexer_k->nb[3], 0);
     cb(indexer_k, "lid_k", il);
 
+    // TurboQuant basis rule — see build_csa_lid_attention. The lid cache
+    // stores its rows WHT-rotated like every other turbo cache; scoring an
+    // unrotated indexer query against them scrambles the top-k SELECTION
+    // itself — a fixed, bits-independent quality tax on every turbo K type
+    // (turbo4 measured no better than turbo3 until this was fixed).
+    if (indexer_k->type == GGML_TYPE_TURBO3_0 || indexer_k->type == GGML_TYPE_TURBO4_0 || indexer_k->type == GGML_TYPE_TURBO2_0) {
+        if (indexer_q->type != GGML_TYPE_F32) { indexer_q = ggml_cast(ctx0, indexer_q, GGML_TYPE_F32); }
+        if (indexer_q->ne[0] % 128 != 0) {
+            const int64_t pad = ((indexer_q->ne[0] + 127) / 128) * 128 - indexer_q->ne[0];
+            indexer_q = ggml_pad(ctx0, indexer_q, pad, 0, 0, 0);
+        }
+        if (!ggml_is_contiguous(indexer_q)) { indexer_q = ggml_cont(ctx0, indexer_q); }
+        indexer_q = ggml_turbo_wht(ctx0, indexer_q, 0, 0, nullptr);
+        cb(indexer_q, "lid_q_wht", il);
+    }
+
     const int64_t n_stream = indexer_k->ne[3];
     indexer_q = ggml_view_4d(ctx0, indexer_q,
             indexer_q->ne[0], indexer_q->ne[1], indexer_q->ne[2]/n_stream, n_stream,
