@@ -1354,6 +1354,13 @@ void launch_fattn(
             }
         }
 
+        {
+            static const int pb_override = getenv("GGML_CUDA_FATTN_PB") ? atoi(getenv("GGML_CUDA_FATTN_PB")) : 0;
+            if (pb_override > 0) {
+                parallel_blocks = std::min(pb_override, ntiles_KV);
+            }
+        }
+
         blocks_num.x = ntiles_x;
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];

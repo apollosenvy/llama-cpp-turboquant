@@ -133,6 +133,7 @@ struct heph_row_job {
 struct heph_row_jobs {
     heph_row_job job[HEPH_ROW_MAX_JOBS];
     int          n;
+    float        perturb; // 1, or 1 + GGML_CUDA_HEPH_PERTURB: scales every row, to measure how far a rounding-sized change travels
 };
 void ggml_cuda_op_row_jobs(ggml_backend_cuda_context & ctx, const heph_row_jobs & jobs);
 

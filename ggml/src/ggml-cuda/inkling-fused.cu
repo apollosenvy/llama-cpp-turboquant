@@ -1034,6 +1034,7 @@ static __global__ void row_jobs_f32(const heph_row_jobs jobs) {
     if (j.post) {
         v *= j.post[row / j.rows_per_token];
     }
+    v *= jobs.perturb;
     if (j.rot == nullptr) {
         if (active) {
             j.dst[idx] = v;
@@ -1134,8 +1135,13 @@ static __global__ void row_jobs_f32(const heph_row_jobs jobs) {
 }
 static_assert(QK_TURBO3 == 128, "a row job stores one turbo3 block per row");
 
-void ggml_cuda_op_row_jobs(ggml_backend_cuda_context & ctx, const heph_row_jobs & jobs) {
-    GGML_ASSERT(jobs.n >= 1 && jobs.n <= HEPH_ROW_MAX_JOBS);
+void ggml_cuda_op_row_jobs(ggml_backend_cuda_context & ctx, const heph_row_jobs & jobs_in) {
+    GGML_ASSERT(jobs_in.n >= 1 && jobs_in.n <= HEPH_ROW_MAX_JOBS);
+    // Sensitivity instrument: GGML_CUDA_HEPH_PERTURB=1e-6 scales every row by 1 + 1e-6. Comparing logits with and without
+    // it shows how much of a difference between two builds can come from float rounding alone.
+    static const float perturb = getenv("GGML_CUDA_HEPH_PERTURB") ? 1.0f + (float) atof(getenv("GGML_CUDA_HEPH_PERTURB")) : 1.0f;
+    heph_row_jobs jobs = jobs_in;
+    jobs.perturb = perturb;
     const uint32_t blocks = jobs.job[jobs.n - 1].block_end;
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(blocks, 1, 1), dim3(128, 1, 1), 0, ctx.stream());
     ggml_cuda_kernel_launch(row_jobs_f32, lp, jobs);

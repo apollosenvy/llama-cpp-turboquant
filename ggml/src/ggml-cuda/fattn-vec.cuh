@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
+#include "fattn-turbo3.cuh"
 
 static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc) {
     return 128;
@@ -576,6 +577,28 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
+#ifdef GGML_CUDA_FATTN_TURBO3_AVAILABLE
+    if constexpr (D == QK_TURBO3 && type_K == GGML_TYPE_TURBO3_0 && type_V == GGML_TYPE_TURBO3_0) {
+        // GGML_CUDA_HEPH_FUSE=0 or GGML_CUDA_HEPH_NOFUSE=...,t3attn,... falls back to the generic kernel
+        static const bool enabled = [] {
+            const char * all = getenv("GGML_CUDA_HEPH_FUSE");
+            const char * off = getenv("GGML_CUDA_HEPH_NOFUSE");
+            return !(all && all[0] == '0') && !(off && strstr(off, "t3attn"));
+        }();
+        // the kernel is written for 32-lane waves with the half dot product instruction
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        if (enabled && GGML_CUDA_CC_IS_RDNA(cc) && cc >= GGML_CUDA_CC_RDNA2 && logit_softcap == 0.0f && (Q->ne[1] == 1 || Q->ne[1] == 3)) {
+            constexpr size_t nbytes_shared = 0;
+            if (Q->ne[1] == 1) {
+                launch_fattn<D, 1, 1>(ctx, dst, flash_attn_ext_turbo3<1>, 4, nbytes_shared, D, false, false, false, false);
+            } else {
+                launch_fattn<D, 3, 1>(ctx, dst, flash_attn_ext_turbo3<3>, 4, nbytes_shared, D, false, false, false, false);
+            }
+            return;
+        }
+    }
+#endif // GGML_CUDA_FATTN_TURBO3_AVAILABLE
+
     if (Q->ne[1] == 1) {
         constexpr int cols_per_block = 1;
         if (logit_softcap == 0.0f) {
@@ -585,6 +608,14 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
             constexpr bool use_logit_softcap = true;
             ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
         }
+        return;
+    }
+
+    // three columns: the query heads of one K/V head (grouped-query ratio 3) evaluated together, see build_attn_mha
+    if (Q->ne[1] == 3 && type_K == GGML_TYPE_TURBO3_0 && logit_softcap == 0.0f) {
+        constexpr int cols_per_block = 3;
+        constexpr bool use_logit_softcap = false;
+        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
         return;
     }
 

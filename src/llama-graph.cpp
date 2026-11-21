@@ -3190,15 +3190,40 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     // the stream dim steps over one stream's worth of dim-2 (tokens): (ne[2]/n_stream) rows of stride nb[2].
     // q->nb[3]/n_stream only equals that for a contiguous q; nope-only MLA (glm5-next) passes a permuted
     // q_absorbed where nb[3] != ne[2]*nb[2], so using nb[3] read another head's queries for streams s >= 1.
-    q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[2]*(q->ne[2]/n_stream), 0);
+    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
 
-    q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+    // Single-token decode with grouped-query attention and a mask per head: hand the query heads that share one K/V head
+    // to flash attention as columns of that head, [d, g, n_head_kv] instead of [d, 1, n_head]. A block then reads and
+    // decodes every key and value once for the g heads rather than once per head; at long context the kernel is bound
+    // by those reads. The heads of a group sit next to each other in q and in the mask, so both are plain reshapes; the
+    // result comes back as [d, n_head_kv, g] and is permuted to the head order. Sinks must be uniform (a constant fill).
+    // Below a few thousand keys the kernel is bound by its fixed cost, where three columns are slower than one and the
+    // permute back is one more launch: on an RX 7900 XTX the two layouts cross at about 8K keys.
+    const int64_t gqa_cols = k->ne[1] > 0 ? q->ne[1]/k->ne[1] : 0;
+    static const int64_t gqa_cols_min_kv = getenv("LLAMA_GQA_COLS") ? atoll(getenv("LLAMA_GQA_COLS")) : 8192 + 1; // 0: never
+    const bool gqa_as_cols = gqa_cols_min_kv > 0 && k->ne[2] >= gqa_cols_min_kv && hparams.f_max_alibi_bias == 0.0f &&
+        use_flash_attn && !kv_rows && !v_mla && n_stream == 1 && q->ne[2] == 1 && q->ne[3] == 1 &&
+        gqa_cols == 3 && q->ne[1] == gqa_cols*k->ne[1] && ggml_is_contiguous(q) &&
+        kq_mask && kq_mask->type == GGML_TYPE_F16 && ggml_is_contiguous(kq_mask) && kq_mask->ne[1] == 1 && kq_mask->ne[2] == q->ne[1] &&
+        kq_mask->ne[3] == 1 && (sinks == nullptr || sinks->op == GGML_OP_FILL) &&
+        k->type == GGML_TYPE_TURBO3_0 && v->type == GGML_TYPE_TURBO3_0 && !hparams.attn_soft_cap;
+
+    if (gqa_as_cols) {
+        q       = ggml_reshape_3d(ctx0, q, q->ne[0], gqa_cols, k->ne[1]);
+        kq_mask = ggml_reshape_3d(ctx0, kq_mask, kq_mask->ne[0], gqa_cols, k->ne[1]);
+        if (sinks) {
+            sinks = ggml_view_1d(ctx0, sinks, k->ne[1], 0);
+        }
+    } else {
+        q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[2]*(q->ne[2]/n_stream), 0);
+
+        q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+    }
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
 
     ggml_tensor * cur;
 
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
     GGML_ASSERT(use_flash_attn || kv_rows == nullptr);
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
@@ -3247,7 +3272,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 #endif
         }
 
-        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+        if (gqa_as_cols) {
+            // [d, n_head_kv, g] -> [d, g, n_head_kv], which is the head order, one token
+            cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 0, 2, 1, 3));
+            cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1]*cur->ne[2], 1);
+        } else {
+            cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+        }
     } else {
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
         cb(kq, "kq", il);

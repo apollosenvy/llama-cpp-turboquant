@@ -783,6 +783,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (Q->ne[1] <= 2) {
                 return BEST_FATTN_KERNEL_VEC;
             }
+            // the three query heads of one K/V head as columns (single-token decode); there is no logit softcap instance
+            float softcap;
+            memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(float));
+            if (Q->ne[1] == 3 && K->type == GGML_TYPE_TURBO3_0 && V->type == GGML_TYPE_TURBO3_0 && softcap == 0.0f) {
+                return BEST_FATTN_KERNEL_VEC;
+            }
         }
     }
     return BEST_FATTN_KERNEL_TILE;
