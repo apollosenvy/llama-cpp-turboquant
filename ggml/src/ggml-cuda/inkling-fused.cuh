@@ -82,3 +82,7 @@ const char * ggml_cuda_heph_q8_1(ggml_backend_cuda_context & ctx, const ggml_ten
 
 // several Q8_0 matrix x vector products (MUL_MAT nodes) in one launch
 void ggml_cuda_op_mmv_q8_0_multi(ggml_backend_cuda_context & ctx, ggml_tensor ** nodes, int n);
+
+// rms_norm(x)*w for one vector, F32 result plus its q8_1 form written to q8_1
+void ggml_cuda_op_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w, ggml_tensor * dst,
+                                  void * q8_1, float eps);

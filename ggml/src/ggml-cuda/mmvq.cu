@@ -1565,6 +1565,10 @@ const char * ggml_cuda_heph_q8_1(ggml_backend_cuda_context & ctx, const ggml_ten
     if (hit) {
         *hit = false;
     }
+    // a reshape of a whole tensor stands for that tensor
+    if (src1->view_src != nullptr && src1->view_offs == 0 && src1->data == src1->view_src->data && ggml_nelements(src1->view_src) == ne10) {
+        src1 = src1->view_src;
+    }
     if (!heph_qcache_enabled() || src1->type != GGML_TYPE_F32 || ggml_nelements(src1) != ne10 || q8_1_size > cache::slot_bytes ||
         src1->op == GGML_OP_NONE || src1->view_src != nullptr || !ggml_is_contiguous(src1)) {
         return nullptr;
@@ -1805,7 +1809,7 @@ void ggml_cuda_mul_mat_vec_q(
     const size_t  q8_1_size   = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
     // HEPH: one vector read by several matvecs (Q, relative bias, sinks and gate share their input) is quantized once
-    const char * src1_q = ids ? nullptr : ggml_cuda_heph_q8_1(ctx, src1, true);
+    const char * src1_q = ne11 == 1 && ne12 == 1 && ne13 == 1 ? ggml_cuda_heph_q8_1(ctx, src1, true) : nullptr;
     if (src1_q == nullptr) {
         src1_q8_1.alloc(q8_1_size);
         const int64_t s11 = src1->nb[1] / ts_src1;

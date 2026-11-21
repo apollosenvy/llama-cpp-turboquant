@@ -768,3 +768,77 @@ void ggml_cuda_op_rot_rows(ggml_backend_cuda_context & ctx, const heph_rot_args 
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(n_rows, 1, 1), dim3(128, 1, 1), 0, ctx.stream());
     ggml_cuda_kernel_launch(rot_rows_f32<128, 4>, lp, a);
 }
+
+// rms_norm(x)*w for one vector of at most HEPH_NORMQ_J*HEPH_NORMQ_BLOCK elements: writes the F32 result and its q8_1
+// form (as quantize_q8_1 would, zero blocks up to n_pad), so the matvecs that read it need no quantize launch.
+#define HEPH_NORMQ_BLOCK 1024
+#define HEPH_NORMQ_J 3
+static __global__ void rms_norm_mul_q8_f32(const float * x, const float * w, float * dst, block_q8_1 * q,
+                                           const int n, const int n_pad, const float eps) {
+    ggml_cuda_pdl_lc();
+    const int tid  = threadIdx.x;
+    const int lane = tid % WARP_SIZE;
+
+    __shared__ float s_part[HEPH_NORMQ_BLOCK / WARP_SIZE];
+    __shared__ float s_total;
+
+    ggml_cuda_pdl_sync();
+
+    float xv[HEPH_NORMQ_J];
+    float wv[HEPH_NORMQ_J];
+#pragma unroll
+    for (int j = 0; j < HEPH_NORMQ_J; ++j) {
+        const int  e  = tid + j*HEPH_NORMQ_BLOCK;
+        const bool in = e < n;
+        xv[j] = in ? x[e] : 0.0f;
+        wv[j] = in ? w[e] : 0.0f;
+    }
+    float ss = 0.0f;
+#pragma unroll
+    for (int j = 0; j < HEPH_NORMQ_J; ++j) {
+        ss += xv[j]*xv[j];
+    }
+    ss = warp_reduce_sum(ss);
+    if (lane == 0) {
+        s_part[tid / WARP_SIZE] = ss;
+    }
+    __syncthreads();
+    if (tid < WARP_SIZE) {
+        const float total = warp_reduce_sum(s_part[tid]);
+        if (tid == 0) {
+            s_total = total;
+        }
+    }
+    __syncthreads();
+    const float scale = 1.0f / sqrtf(s_total / n + eps);
+
+#pragma unroll
+    for (int j = 0; j < HEPH_NORMQ_J; ++j) {
+        const int   e = tid + j*HEPH_NORMQ_BLOCK;
+        const float v = xv[j]*scale*wv[j];
+        if (e < n) {
+            dst[e] = v;
+        }
+        if (e < n_pad) { // the same for a whole warp: a warp is one q8_1 block
+            const float amax = warp_reduce_max<QK8_1>(fabsf(v));
+            const float d    = amax / 127.0f;
+            const int8_t qv  = amax == 0.0f ? 0 : roundf(v / d);
+            const int   sum  = warp_reduce_sum<QK8_1>((int) qv);
+            q[e / QK8_1].qs[lane] = qv;
+            if (lane == 0) {
+                q[e / QK8_1].ds = make_half2(d, d * sum);
+            }
+        }
+    }
+}
+static_assert(HEPH_NORMQ_BLOCK / WARP_SIZE == WARP_SIZE && WARP_SIZE == QK8_1, "one warp per q8_1 block, one warp of partial sums");
+
+void ggml_cuda_op_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w, ggml_tensor * dst,
+                                  void * q8_1, float eps) {
+    const int n     = ggml_nelements(dst);
+    const int n_pad = GGML_PAD(n, MATRIX_ROW_PADDING);
+    GGML_ASSERT(n <= HEPH_NORMQ_J*HEPH_NORMQ_BLOCK && n_pad <= HEPH_NORMQ_J*HEPH_NORMQ_BLOCK);
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(1, 1, 1), dim3(HEPH_NORMQ_BLOCK, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(rms_norm_mul_q8_f32, lp, (const float *) x->data, (const float *) w->data, (float *) dst->data,
+        (block_q8_1 *) q8_1, n, n_pad, eps);
+}

@@ -5613,6 +5613,34 @@ static int ggml_cuda_try_fuse_mmv_group(ggml_backend_cuda_context * cuda_ctx, gg
     return last - i;
 }
 
+// RMS_NORM MUL(weight) on one vector: the kernel also writes the q8_1 form the following matvecs read
+static int ggml_cuda_try_fuse_normq(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = heph_fuse_enabled("normq");
+    ggml_tensor * rms = cgraph->nodes[i];
+    if (!enabled || rms->op != GGML_OP_RMS_NORM) {
+        return 0;
+    }
+    const int i_mul = heph_next_real(cgraph, i + 1);
+    if (i_mul < 0 || cgraph->nodes[i_mul]->op != GGML_OP_MUL) {
+        return 0;
+    }
+    ggml_tensor *       mul = cgraph->nodes[i_mul];
+    const ggml_tensor * x   = rms->src[0];
+    const ggml_tensor * w   = mul->src[0] == rms ? mul->src[1] : mul->src[1] == rms ? mul->src[0] : nullptr;
+    const int64_t       n   = ggml_nelements(mul);
+    if (w == nullptr || w == rms || w->op != GGML_OP_NONE || !heph_f32c(w) || ggml_nelements(w) != n || w->ne[0] != n ||
+        !heph_f32c(x) || ggml_nelements(x) != n || x->ne[0] != n || !heph_f32c(mul) || mul->ne[0] != n ||
+        GGML_PAD(n, MATRIX_ROW_PADDING) > 3*1024 || heph_overlap(mul, w) || !heph_uses_confined(cgraph, i, i_mul)) {
+        return 0;
+    }
+    char * q = (char *) ggml_cuda_heph_q8_1(*cuda_ctx, mul, false);
+    if (q == nullptr) {
+        return 0;
+    }
+    ggml_cuda_op_rms_norm_mul_q8(*cuda_ctx, x, w, mul, q, ggml_get_op_params_f32(rms, 0));
+    return i_mul - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -5656,6 +5684,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return n;
         }
         if (const int n = ggml_cuda_try_fuse_loop_control_raw(cuda_ctx, cgraph, i)) {
+            ++ggml_cuda_heph_fuse_count;
+            return n;
+        }
+        if (const int n = ggml_cuda_try_fuse_normq(cuda_ctx, cgraph, i)) {
             ++ggml_cuda_heph_fuse_count;
             return n;
         }
