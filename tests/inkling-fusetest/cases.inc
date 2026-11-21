@@ -424,5 +424,33 @@ static std::vector<test_case> cases() {
         b.silent = { w };
         b.outputs = { x, gate_inp, w, ggml_scale(ctx, out, 1.0f), ggml_scale(ctx, wn, 1.0f), ggml_scale(ctx, bias, 1.0f) };
         return b; }});
+    for (int n_kv : {1024, 8192, 16384, 65536}) for (int cols : {1, 3}) {
+        // flash attention over turbo3 K/V caches with a per-head F16 mask, as a decode step runs it. The GPU kernel
+        // accumulates in half precision, so the CPU comparison is loose; FUSEDUMP compares two builds bit for bit.
+        // kv16384: also runs of 64 keys that are masked, or biased by -12 (weights that are tiny but not zero), for all
+        // heads. Long enough that a block takes several tiles.
+        const bool blocks = n_kv == 16384;
+        test_case tc = {std::string(blocks ? "flasht3runs_kv" : "flasht3_kv") + std::to_string(n_kv) + "_c" + std::to_string(cols), [n_kv, cols, blocks](ggml_context * ctx) {
+            built b; const int64_t D = 128, H = 24, HK = 8;
+            ggml_tensor * tok = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv); ggml_set_name(tok, "rows_all"); ggml_set_input(tok); b.inputs.push_back(tok);
+            ggml_tensor * kv[2];
+            for (int i = 0; i < 2; ++i) {
+                ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_TURBO3_0, D*HK, n_kv); ggml_set_input(cache); b.inputs.push_back(cache);
+                ggml_tensor * rows = ggml_scale(ctx, inp(ctx, b, D*HK, n_kv), 1.0f);
+                ggml_tensor * set = ggml_set_rows(ctx, cache, rows, tok);
+                kv[i] = ggml_permute(ctx, ggml_view_3d(ctx, set, D, HK, n_kv, ggml_row_size(set->type, D), ggml_row_size(set->type, D*HK), 0), 0, 2, 1, 3);
+            }
+            // cols 3: the three query heads of each K/V head as columns of that head (what build_attn_mha does for one token)
+            ggml_tensor * q = ggml_scale(ctx, inp(ctx, b, D, cols, H/cols), 0.6f);
+            ggml_tensor * mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_kv, cols, H/cols); ggml_set_input(mask); b.inputs.push_back(mask);
+            if (blocks) {
+                ggml_set_name(mask, "mask_blocks");
+            }
+            ggml_tensor * out = ggml_flash_attn_ext(ctx, q, kv[0], kv[1], mask, 1.0f/sqrtf((float) D), 0.0f, 0.0f);
+            b.outputs = { out };
+            return b; }};
+        tc.tol = 1e-4; tc.plain = true;
+        v.push_back(tc);
+    }
     return v;
 }

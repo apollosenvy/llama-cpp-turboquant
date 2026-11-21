@@ -32,6 +32,7 @@ static ggml_tensor * inp(ggml_context * ctx, built & b, int64_t n0, int64_t n1 =
 }
 
 static double g_bench_us = 0.0;
+static std::string g_case; // name of the case being run
 static size_t g_repeat_bad = 0; // FUSEREPEAT: output reads that differed from the first evaluation
 static bool g_test_side = false; // true while building the graph under test, false for the reference graph
 static std::vector<bool> g_out_f16; // which outputs of the last run were F16
@@ -63,7 +64,8 @@ static std::vector<std::vector<float>> run(ggml_backend_t backend, const builder
             ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
         } else if (t->type == GGML_TYPE_I64) { // distinct cache rows, one per token
             std::vector<int64_t> v(ggml_nelements(t));
-            for (size_t i = 0; i < v.size(); ++i) v[i] = 3*i + 1 + rng() % 2;
+            const bool all = strncmp(t->name, "rows_all", 8) == 0; // every cache row in order, or scattered rows
+            for (size_t i = 0; i < v.size(); ++i) v[i] = all ? (int64_t) i : (int64_t) (3*i + 1 + rng() % 2);
             ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
         } else if (t->type == GGML_TYPE_TURBO3_0) { // an empty KV cache
             std::vector<uint8_t> v(ggml_nbytes(t), 0);
@@ -76,7 +78,16 @@ static std::vector<std::vector<float>> run(ggml_backend_t backend, const builder
             ggml_backend_tensor_set(t, q.data(), 0, ggml_nbytes(t));
         } else if (t->type == GGML_TYPE_F16) { // an attention mask: 0 or -inf
             std::vector<ggml_fp16_t> v(ggml_nelements(t));
-            for (ggml_fp16_t & f : v) f = ggml_fp32_to_fp16(rng() % 4 == 0 ? -INFINITY : 0.0f);
+            // "mask_blocks": also about a third of the runs of 64 keys masked for all heads (no period, so that every
+            // block layout meets masked runs before and after unmasked ones): whole waves of a kernel see no key
+            const bool blocks = strncmp(t->name, "mask_blocks", 11) == 0;
+            for (size_t e = 0; e < v.size(); ++e) {
+                const uint32_t run64 = (uint32_t) ((e % t->ne[0])/64);
+                const uint32_t kind  = blocks ? ((run64*2654435761u) >> 24) % 3 : 0;
+                // kind 2: a bias of -12, keys whose weight is tiny but not zero. Skipping those would be an error
+                // that the CPU comparison is too loose to see and a bit compare against the no-skip kernel does see.
+                v[e] = ggml_fp32_to_fp16(kind == 2 ? -12.0f : kind == 1 || rng() % 4 == 0 ? -INFINITY : 0.0f);
+            }
             ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
         } else {
             std::vector<float> v(ggml_nelements(t));
@@ -130,6 +141,13 @@ static std::vector<std::vector<float>> run(ggml_backend_t backend, const builder
         }
         res.push_back(v);
     }
+    if (const char * dir = g_test_side ? getenv("FUSEDUMP") : nullptr) { // raw outputs, to compare two builds bit for bit
+        for (size_t k = 0; k < res.size(); ++k) {
+            const std::string path = std::string(dir) + "/" + g_case + "-s" + std::to_string(seed) + "-o" + std::to_string(k) + ".bin";
+            FILE * fp = fopen(path.c_str(), "wb");
+            if (fp) { fwrite(res[k].data(), sizeof(float), res[k].size(), fp); fclose(fp); }
+        }
+    }
     if (const char * nr = g_test_side ? getenv("FUSEREPEAT") : nullptr) { // determinism: the same graph and inputs must give the same bytes every time
         size_t bad = 0;
         const int n = atoi(nr);
@@ -156,7 +174,8 @@ static std::vector<std::vector<float>> run(ggml_backend_t backend, const builder
 }
 
 // cpu_both: the graph under test also runs on the CPU backend (checks a CPU implementation against the reference chain)
-struct test_case { std::string name; builder build; bool cpu_both = false; };
+// tol: NMSE bound against the CPU reference. plain: a stock kernel is under test, no fusion has to fire.
+struct test_case { std::string name; builder build; bool cpu_both = false; double tol = 1e-9; bool plain = false; };
 
 // --- the chains, written exactly as src/models/inkling2.cpp writes them ---
 static ggml_tensor * clip(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * scale, float threshold) {
@@ -208,6 +227,7 @@ int main(int argc, char ** argv) {
     for (const test_case & tc : cases()) {
         if (argc > 1 && tc.name.find(argv[1]) == std::string::npos) continue;
         double worst = 0.0;
+        g_case = tc.name;
         const int fused_before = ggml_cuda_heph_fuse_count; // a reused device graph does not re-run the matcher, so count per case
         for (unsigned seed = 1; seed <= 3; ++seed) {
             g_test_side = true;
@@ -237,7 +257,7 @@ int main(int argc, char ** argv) {
                 // F16 outputs: a last-bit float difference can flip a whole half step (1e-3 relative), measured up to 2e-9.
                 // A 0.1 % kernel error gives 1e-6 either way.
                 const double nm = num/(den + 1e-30)*(g_out_f16[o] ? 0.1 : 1.0);
-                if (!(nm < 1e-9)) { // say where: which output, and the first element that is off
+                if (!(nm < tc.tol)) { // say where: which output, and the first element that is off
                     size_t first = 0;
                     while (first < g[o].size() && std::fabs((double) g[o][first] - c[o][first]) <= 1e-4*std::fabs(c[o][first]) + 1e-9) ++first;
                     fprintf(stderr, "  %s: seed %u output %zu of %zu, nmse %.3g, %zu elements, first off at %zu: test %g ref %g\n", tc.name.c_str(), seed, o, g.size(),
@@ -246,9 +266,9 @@ int main(int argc, char ** argv) {
                 worst = std::max(worst, nm);
             }
         }
-        if (!tc.cpu_both && ggml_cuda_heph_fuse_count == fused_before) { worst = INFINITY; fprintf(stderr, "%s: fusion did not fire\n", tc.name.c_str()); }
+        if (!tc.cpu_both && !tc.plain && ggml_cuda_heph_fuse_count == fused_before) { worst = INFINITY; fprintf(stderr, "%s: fusion did not fire\n", tc.name.c_str()); }
         if (g_repeat_bad) { worst = INFINITY; g_repeat_bad = 0; }
-        const bool ok = worst < 1e-9;
+        const bool ok = worst < tc.tol;
         printf("%s %-28s nmse=%.3g\n", ok ? "PASS" : "FAIL", tc.name.c_str(), worst);
         fails += !ok;
     }

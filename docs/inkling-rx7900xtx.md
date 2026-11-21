@@ -6,20 +6,23 @@ RX 7900 XTX, with the same GGUF and the same sampling. It is built on llama.cpp 
 
 | | Before | After |
 |---|---|---|
-| Decode, empty context | 29 tok/s | 95 tok/s |
-| Decode at about 100K context | 23.5 tok/s (90K) | 64 tok/s (104K) |
-| Prefill, 8K prompt, 256K context | about 140 tok/s | 1,035 tok/s |
+| Decode, empty context | 29 tok/s | 100 tok/s |
+| Decode at 20K context | | 90 tok/s |
+| Decode at about 100K context | 23.5 tok/s (90K) | 80 tok/s (104K) |
+| Prefill, 8K prompt, 256K context | about 140 tok/s | 1,040 tok/s |
 | Prefill, 104K prompt | about 130 tok/s | 727 tok/s |
-| GPU kernel launches per token | 7,677 | 1,079 |
+| GPU kernel launches per token | 7,677 | 1,075 |
 
 Model: `Inkling-2-Mini-IQ4_NL.gguf` (26B parameters, 24 layers of d_model 2304, 128-expert MoE with 8
 active, layers 6 to 17 looped three times, so 48 layer passes per token). Card: RX 7900 XTX, 24 GB,
 ROCm 10.1.0. "Before" is the same tree without this series, as it was deployed: 512K context, four expert
 layers on the CPU, `-ub 16`. "After" runs 256K context, all experts on the GPU, `-ub 128`.
 
-Output is not token-identical to the unmodified backend. The model is sensitive to float rounding:
-turning the stock backend's own fusions off already shifts next-token probabilities by 0.03 within five
-tokens. Correctness is checked at tensor level instead (see Tests).
+Output is not token-identical to the unmodified backend, and quality is the same. Against the unmodified
+tree on wikitext-2 (context 2048, `llama-perplexity --kl-divergence`): perplexity 6.199 against 6.217
+± 0.19, mean KL divergence 0.018, same top token 94.2%. That divergence is the model's own response to
+float rounding: scaling the Q, K, V and bias rows by one ulp (`GGML_CUDA_HEPH_PERTURB=1e-7`) inside this
+build moves its logits by the same 0.018, and by no more at 1e-4. See Quality.
 
 ## Where the time went
 
@@ -72,6 +75,27 @@ was built by a chain that held two float tensors of `n_kv x n_tokens x n_head` a
 half-precision buffer that every layer reuses. Reserved compute memory per micro-batch token at 256K
 context went from 50 MB to 13.5 MB, which is what allows `-ub 128` instead of 32.
 
+**An attention kernel for the turbo3 cache** (`ggml/src/ggml-cuda/fattn-turbo3.cuh`). For one decoded token the
+generic vector kernel is bound by instruction count, not by memory: its time does not move with the number of
+parallel blocks, and its assembly shows about 2,800 instructions per 128-key tile and wave, of which the 3-bit
+decode is a third. The rest is 64-bit address arithmetic for byte loads, shuffles through LDS and waits. The
+dedicated kernel loads whole code words off a scalar base, decodes 16 values per word (values k, k+4, k+8, k+12
+share a bit offset, so one shift and one mask index four of them), sums across the 8 lanes of a key and broadcasts
+the softmax weights in registers (DPP), and applies the K and V norms once per key. From 8K keys up the three
+query heads that share a K/V head are handed over as three columns of that head, so K and V are read and decoded
+once for the three.
+
+| kernel time per call | 1K keys | 8K keys | 65K keys |
+|---|---|---|---|
+| generic vector kernel | 15.8 us | 41 us | about 300 us |
+| dedicated, one column | 8.0 us | 20 us | 166 us |
+| dedicated, three columns | 10.2 us | 16.5 us | 113 us |
+
+**Lane swaps in registers** (`ggml_cuda_shfl_xor` in `common.cuh`). `__shfl_xor` is a `ds_bpermute`, which goes
+through LDS. For xor masks 1, 2, 4 and 8 the two lanes sit in the same row of 16, where DPP swaps them in
+registers. Same lanes, same results (every test output is bit-identical), and every reduction in the backend gets
+cheaper: 99.5 to 100.6 tok/s.
+
 ## Build and run
 
 ```bash
@@ -97,12 +121,17 @@ Switches, read from the environment at start:
 - `GGML_CUDA_HEPH_NOFUSE=a,b,...` turns named ones off: `clip`, `mix`, `control`, `controlraw`, `ctrlgroup`,
   `situ`, `conv`, `convst`, `moew`, `relbias`, `relpad`, `relfill`, `rot`, `qcache`, `mmv`, `normq`, `normgroup`,
   `postproj`, `outgate`, `route`, `ffntail`.
+  `t3attn` falls back to the generic attention kernel.
+- `LLAMA_GQA_COLS=<keys>` sets the cache length from which query heads are grouped as columns (default 8193,
+  0 never).
 - `GGML_CUDA_DUMP_NODES=1` prints every evaluated node and what was fused, once per captured graph.
+- `GGML_CUDA_HEPH_PERTURB=<eps>` scales the post-projection rows by 1 + eps (sensitivity measurements only).
+- `GGML_CUDA_FATTN_PB=<n>` overrides the number of parallel blocks of the vector attention kernels (tuning only).
 
 ## Tests
 
 `tests/inkling-fusetest` builds each chain as a small graph exactly as the model does, runs it on the GPU
-and on the CPU backend, and compares the outputs. 99 cases, single and multi token.
+and on the CPU backend, and compares the outputs. 107 cases, single and multi token.
 
 ```bash
 tests/inkling-fusetest/build.sh build && tests/inkling-fusetest/fusetest
@@ -111,8 +140,10 @@ tests/inkling-fusetest/build.sh build && tests/inkling-fusetest/fusetest
 - A case fails if no fusion fired, so a matcher that quietly stops matching is caught.
 - Every graph is evaluated twice with different inputs, which catches state carried between evaluations.
 - `FUSEREPEAT=200` re-evaluates each graph 200 times and requires bit-identical GPU output.
+- `FUSEDUMP=<dir>` writes every output as raw floats, to compare two builds bit for bit. A change that claims to
+  be exact (the lane swaps above) is checked this way; the CPU comparison is too loose for that.
 - `kbench.sh <case>` prints per-kernel times for one case from a `rocprofv3` trace. A case only covers a
-  kernel if the kernel shows up there.
+  kernel if the kernel shows up there. `kgrid.sh <case> <kernel>` adds grid, block size and register count.
 - About twenty errors were planted across the kernels (wrong scale, shifted state, bit order, job index,
   stale cache) and each made the expected case fail.
 
@@ -125,12 +156,31 @@ Known gaps:
 - Constants are for this card: thread counts, the slow grid sizes, the q8_1 cache slot size.
   Other GPUs are untested.
 
+## Quality
+
+Wikitext-2 test set, context 2048, against logits saved from the unmodified tree.
+
+| path | perplexity (unmodified) | mean KL divergence | same top token |
+|---|---|---|---|
+| batches (512 / 128) | 6.199 (6.217) | 0.0185 | 94.2% |
+| token by token, one column | 6.367 (6.386) | 0.0156 | 94.2% |
+| token by token, three columns in every layer | 6.353 | 0.0159 | 94.7% |
+| this build with rows scaled by 1 + 1e-7, against itself | | 0.0186 | 94.6% |
+
+Two runs of the same build agree exactly. End to end, a code planted at the start of an 8K prompt is recalled at
+256K context, and two codes (start and middle) of a 33.6K-token prompt are recalled with one column and with three.
+
+A build is not measured for quality by the kernel tests, and a decode-speed run does not notice a wrong router:
+both checks are needed. One build of this series had a router kernel left over from a timing experiment and
+scored perplexity 88; the speed benchmarks looked normal.
+
 ## What is left
 
-Weight reads are 5.1 ms of the 10.5 ms per token and run at about 80% of peak bandwidth while active. The
-other 5.4 ms is still small kernels and gaps. At long context, decode pays about 5 ms per token per 100K
-tokens in `flash_attn_ext_vec`, which is bound by decoding the 3-bit cache. For batches, the tile attention
-kernel converts the whole K and V of a layer to half floats on every micro-batch.
+Weight reads are 5.6 ms of the 9.9 ms per token (the two control kernels read 7 MB of weights per layer pass and
+count here) and run at about 80% of peak bandwidth while active. Small kernels are 2.2 ms and the gaps between
+launches 2.1 ms: every dispatch of the replayed graph waits for the one before it. At long context, decode pays
+about 1.4 ms per token per 100K tokens in the attention kernel. For batches, the tile attention kernel converts
+the whole K and V of a layer to half floats on every micro-batch.
 
 ## Credits
 
