@@ -433,6 +433,7 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_SLEEP,
+        GGML_OP_REL_BIAS_MASK,
 
         GGML_OP_COUNT,
     };
@@ -2297,6 +2298,22 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
+
+    // attention mask with a relative-position bias, one per head, in F16:
+    //   dst[k, t, h] = (rel_pos[k, t] < n_extent ? <bias[:, rel_pos[k, t]], r[:, h, t]> : 0) - sinks[h, t] + mask[k, t]
+    // bias    [n_rel, n_extent]         F32  bias table, a distance of n_extent or more has no bias
+    // r       [n_rel, n_head, n_tokens] F32
+    // sinks   [n_head, n_tokens]        F32
+    // rel_pos [n_kv, n_tokens]          I32
+    // mask    [n_kv, n_tokens]          F16
+    // result  [n_kv, n_tokens, n_head]  F16
+    GGML_API struct ggml_tensor * ggml_rel_bias_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * r,
+            struct ggml_tensor  * sinks,
+            struct ggml_tensor  * rel_pos,
+            struct ggml_tensor  * mask);
 
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,

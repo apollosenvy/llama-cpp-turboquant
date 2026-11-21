@@ -10007,6 +10007,61 @@ void ggml_compute_forward_ssm_conv(
     }
 }
 
+// ggml_compute_forward_rel_bias_mask
+
+void ggml_compute_forward_rel_bias_mask(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * bias    = dst->src[0];
+    const ggml_tensor * r       = dst->src[1];
+    const ggml_tensor * sinks   = dst->src[2];
+    const ggml_tensor * rel_pos = dst->src[3];
+    const ggml_tensor * mask    = dst->src[4];
+
+    GGML_ASSERT(ggml_is_contiguous(bias) && ggml_is_contiguous(r) && ggml_is_contiguous(sinks) &&
+                ggml_is_contiguous(rel_pos) && ggml_is_contiguous(mask) && ggml_is_contiguous(dst));
+
+    const int64_t n_rel    = bias->ne[0];
+    const int64_t n_extent = bias->ne[1];
+    const int64_t n_kv     = dst->ne[0];
+    const int64_t n_tokens = dst->ne[1];
+    const int64_t n_head   = dst->ne[2];
+
+    const float *       bias_d  = (const float *) bias->data;
+    const float *       r_d     = (const float *) r->data;
+    const float *       sinks_d = (const float *) sinks->data;
+    const int32_t *     pos_d   = (const int32_t *) rel_pos->data;
+    const ggml_fp16_t * mask_d  = (const ggml_fp16_t *) mask->data;
+    ggml_fp16_t *       dst_d   = (ggml_fp16_t *) dst->data;
+
+    // rows of (head, token), split over the threads
+    const int64_t n_rows = n_head*n_tokens;
+    const int64_t dr     = (n_rows + params->nth - 1)/params->nth;
+    const int64_t ir0    = dr*params->ith;
+    const int64_t ir1    = MIN(ir0 + dr, n_rows);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t t = ir % n_tokens;
+        const int64_t h = ir / n_tokens;
+
+        const float * rv   = r_d + (t*n_head + h)*n_rel;
+        const float   sink = sinks_d[t*n_head + h];
+
+        for (int64_t k = 0; k < n_kv; ++k) {
+            const int32_t rp = pos_d[t*n_kv + k];
+            float v = 0.0f;
+            if (rp >= 0 && rp < n_extent) {
+                const float * b = bias_d + (int64_t) rp*n_rel;
+                for (int64_t j = 0; j < n_rel; ++j) {
+                    v += b[j]*rv[j];
+                }
+            }
+            v = v - sink + GGML_CPU_FP16_TO_FP32(mask_d[t*n_kv + k]);
+            dst_d[(h*n_tokens + t)*n_kv + k] = GGML_CPU_FP32_TO_FP16(v);
+        }
+    }
+}
+
 // ggml_compute_forward_ssm_scan
 
 static void ggml_compute_forward_ssm_scan_f32(

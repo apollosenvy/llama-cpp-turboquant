@@ -2044,6 +2044,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_sleep(params, tensor);
             } break;
+        case GGML_OP_REL_BIAS_MASK:
+            {
+                ggml_compute_forward_rel_bias_mask(params, tensor);
+            } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 ggml_compute_forward_flash_attn_ext(params, tensor);
@@ -2319,6 +2323,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SLEEP:
             {
                 n_tasks = 1;
+            } break;
+        case GGML_OP_REL_BIAS_MASK:
+            {
+                n_tasks = n_threads;
             } break;
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(node)) {

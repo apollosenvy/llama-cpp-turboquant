@@ -1124,9 +1124,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "SLEEP",
+    "REL_BIAS_MASK",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1239,9 +1240,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "sleep(x)",
+    "rel_bias_mask(x)",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6187,6 +6189,38 @@ struct ggml_tensor * ggml_custom_inplace(
     for (int i = 0; i < n_args; i++) {
         result->src[i + 1] = args[i];
     }
+
+    return result;
+}
+
+// ggml_rel_bias_mask
+
+struct ggml_tensor * ggml_rel_bias_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * bias,
+        struct ggml_tensor  * r,
+        struct ggml_tensor  * sinks,
+        struct ggml_tensor  * rel_pos,
+        struct ggml_tensor  * mask) {
+    const int64_t n_rel    = bias->ne[0];
+    const int64_t n_head   = r->ne[1];
+    const int64_t n_tokens = r->ne[2];
+    const int64_t n_kv     = rel_pos->ne[0];
+
+    GGML_ASSERT(bias->type == GGML_TYPE_F32 && ggml_is_matrix(bias));
+    GGML_ASSERT(r->type == GGML_TYPE_F32 && r->ne[0] == n_rel && r->ne[3] == 1);
+    GGML_ASSERT(sinks->type == GGML_TYPE_F32 && sinks->ne[0] == n_head && ggml_nelements(sinks) == n_head*n_tokens);
+    GGML_ASSERT(rel_pos->type == GGML_TYPE_I32 && rel_pos->ne[1] == n_tokens && ggml_nelements(rel_pos) == n_kv*n_tokens);
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 && mask->ne[0] == n_kv && mask->ne[1] == n_tokens && ggml_nelements(mask) == n_kv*n_tokens);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_kv, n_tokens, n_head);
+
+    result->op     = GGML_OP_REL_BIAS_MASK;
+    result->src[0] = bias;
+    result->src[1] = r;
+    result->src[2] = sinks;
+    result->src[3] = rel_pos;
+    result->src[4] = mask;
 
     return result;
 }

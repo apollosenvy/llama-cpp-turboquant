@@ -3160,6 +3160,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SLEEP:
             ggml_cuda_op_sleep(ctx, dst);
             break;
+        case GGML_OP_REL_BIAS_MASK:
+            ggml_cuda_op_rel_bias_mask(ctx, dst->src[0], dst->src[1]->data, dst->src[2]->data, dst->src[3], dst->src[4], dst, nullptr, nullptr, 0.0f);
+            break;
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
             break;
@@ -5529,6 +5532,31 @@ static int ggml_cuda_try_fuse_rot(ggml_backend_cuda_context * cuda_ctx, ggml_cgr
     return i_rot == i ? HEPH_FUSED_SELF : i_rot - i;
 }
 
+// rel_bias_mask followed by the small constant fill of the attention sinks: the kernel writes the fill as well
+static int ggml_cuda_try_fuse_rel_op_fill(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = heph_fuse_enabled("relfill");
+    ggml_tensor * op = cgraph->nodes[i];
+    if (!enabled || op->op != GGML_OP_REL_BIAS_MASK) {
+        return 0;
+    }
+    const int i_fill = heph_next_real(cgraph, i + 1);
+    if (i_fill < 0) {
+        return 0;
+    }
+    ggml_tensor * f = cgraph->nodes[i_fill];
+    if (f->op != GGML_OP_FILL || !heph_f32c(f) || ggml_nelements(f) > 4096 || ggml_nelements(f) > ggml_nelements(op) || heph_overlap(f, op)) {
+        return 0;
+    }
+    for (int s = 0; s < 5; ++s) {
+        if (!ggml_is_contiguous(op->src[s]) || heph_overlap(f, op->src[s])) {
+            return 0;
+        }
+    }
+    ggml_cuda_op_rel_bias_mask(*cuda_ctx, op->src[0], op->src[1]->data, op->src[2]->data, op->src[3], op->src[4], op, nullptr,
+        f, ggml_get_op_params_f32(f, 0));
+    return i_fill - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -5544,6 +5572,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return n;
         }
         if (const int n = ggml_cuda_try_fuse_rot(cuda_ctx, cgraph, i)) {
+            ++ggml_cuda_heph_fuse_count;
+            return n;
+        }
+        if (const int n = ggml_cuda_try_fuse_rel_op_fill(cuda_ctx, cgraph, i)) {
             ++ggml_cuda_heph_fuse_count;
             return n;
         }
@@ -7961,6 +7993,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
         case GGML_OP_TOP_K_MASK:
             return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
+        case GGML_OP_REL_BIAS_MASK:
+            return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op->src[2]) &&
+                   ggml_is_contiguous(op->src[3]) && ggml_is_contiguous(op->src[4]);
         case GGML_OP_SLEEP:
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
             return false;
