@@ -192,6 +192,7 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
 
 // causal short convolution with a residual; dynamic adds input-dependent taps per head
 // the last n_conv - 1 inputs of each sequence live in the recurrent state at channel offset `offset`
+// store: if given, receives the state store for the caller to expand, or nullptr if it is in the graph already
 ggml_tensor * llama_model_inkling2::graph::convolve(
         ggml_tensor * cur,
         ggml_tensor * weight,
@@ -199,7 +200,8 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
         ggml_tensor * state,
         ggml_tensor * history,
         llm_graph_input_rs * inp,
-        int64_t offset) {
+        int64_t offset,
+        ggml_tensor ** store) {
     const int64_t n_conv       = hparams.n_shortconv_l_cache;
     const int64_t n_channels   = cur->ne[0];
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
@@ -210,7 +212,8 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
     x = ggml_concat(ctx0, past, x, 0);
 
-    build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
+    // store: the caller places the state store in the graph (next to the rest of this value's chain)
+    build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state), store);
 
     ggml_tensor * out = ggml_ssm_conv(ctx0, x, weight);
     out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
@@ -340,25 +343,27 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         // backend can evaluate the whole run in one launch. Node order only.
         ggml_tensor * Kraw  = build_lora_mm(layer.wk, inputs[1]);
         ggml_tensor * Vraw  = build_lora_mm(layer.wv, inputs[2]);
-        ggml_tensor * Qcur  = build_lora_mm(layer.wq, inputs[0]);
-        ggml_tensor * Rcur  = build_lora_mm(layer.attn_rel, inputs[0]);
+        ggml_tensor * Qraw  = build_lora_mm(layer.wq, inputs[0]);
+        ggml_tensor * Rraw  = build_lora_mm(layer.attn_rel, inputs[0]);
         ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
         ggml_tensor * gate  = build_lora_mm(layer.wqkv_gate, inputs[0]);
         ggml_tensor * Kdyn  = is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]);
         ggml_tensor * Vdyn  = is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]);
-        for (ggml_tensor * t : { inputs[0], inputs[1], inputs[2], Kraw, Vraw, Qcur, Rcur, sinks, gate, Kdyn, Vdyn }) {
+        for (ggml_tensor * t : { inputs[0], inputs[1], inputs[2], Kraw, Vraw, Qraw, Rraw, sinks, gate, Kdyn, Vdyn }) {
             if (t) {
                 ggml_build_forward_expand(gf, t);
             }
         }
 
-        ggml_tensor * Kcur = convolve(Kraw, layer.attn_k_conv, Kdyn, state, history, recr, 0);
-        ggml_tensor * Vcur = convolve(Vraw, layer.attn_v_conv, Vdyn, state, history, recr, n_embd_k_gqa);
+        ggml_tensor * Kstore = nullptr;
+        ggml_tensor * Vstore = nullptr;
+        ggml_tensor * Kcur = convolve(Kraw, layer.attn_k_conv, Kdyn, state, history, recr, 0, &Kstore);
+        ggml_tensor * Vcur = convolve(Vraw, layer.attn_v_conv, Vdyn, state, history, recr, n_embd_k_gqa, &Vstore);
 
-        Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, hparams.f_qk_clip);
+        ggml_tensor * Qcur = clip(ggml_reshape_3d(ctx0, Qraw, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, hparams.f_qk_clip);
         Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,           hparams.f_qk_clip);
         Vcur = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens), hparams.f_norm_rms_eps);
-        Rcur = clip(ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens), layer.attn_rel_clip, hparams.f_relative_clip);
+        ggml_tensor * Rcur = clip(ggml_reshape_3d(ctx0, Rraw, hparams.n_relative, n_head, n_tokens), layer.attn_rel_clip, hparams.f_relative_clip);
 
         if (!is_swa) {
             Qcur = ggml_mul(ctx0, Qcur, tau);
@@ -369,6 +374,14 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         cb(Kcur, "Kcur", il);
         cb(Vcur, "Vcur", il);
         cb(Rcur, "Rcur", il);
+
+        // The four post-projection chains as one run of nodes, each state store right behind its chain; the rotations
+        // of Q, K and V follow in build_attn. A backend can run all of it in one launch. Node order only.
+        for (ggml_tensor * t : { Rcur, Qcur, Kcur, Kstore, Vcur, Vstore }) {
+            if (t) {
+                ggml_build_forward_expand(gf, t);
+            }
+        }
 
         ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
 
@@ -410,6 +423,12 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         cur = build_attn(inp,
                 nullptr, nullptr, nullptr,
                 Qcur, Kcur, Vcur, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il);
+
+        // Keep the raw projections allocated until here (a view costs nothing to evaluate): the allocator then cannot
+        // hand the memory of one chain's input to another chain's output, which lets the chains run concurrently.
+        for (ggml_tensor * t : { Qraw, Kraw, Vraw, Rraw }) {
+            ggml_build_forward_expand(gf, ggml_reshape_1d(ctx0, t, ggml_nelements(t)));
+        }
 
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);

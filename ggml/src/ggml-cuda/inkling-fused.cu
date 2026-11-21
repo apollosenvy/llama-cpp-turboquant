@@ -842,3 +842,115 @@ void ggml_cuda_op_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, const ggml_te
     ggml_cuda_kernel_launch(rms_norm_mul_q8_f32, lp, (const float *) x->data, (const float *) w->data, (float *) dst->data,
         (block_q8_1 *) q8_1, n, n_pad, eps);
 }
+
+static __global__ void row_jobs_f32(const heph_row_jobs jobs) {
+    constexpr int n_rot  = 128;
+    constexpr int n_conv = 4;
+    constexpr int n_past = n_conv - 1;
+
+    ggml_cuda_pdl_lc();
+    int      ji     = 0;
+    uint32_t block0 = 0;
+#pragma unroll
+    for (int k = 0; k < HEPH_ROW_MAX_JOBS; ++k) {
+        if (k < jobs.n && blockIdx.x >= jobs.job[k].block_end) {
+            ji     = k + 1;
+            block0 = jobs.job[k].block_end;
+        }
+    }
+    if (ji >= jobs.n) {
+        return;
+    }
+    const heph_row_job & j = jobs.job[ji];
+
+    const int     tid    = threadIdx.x;
+    const int64_t row    = blockIdx.x - block0;
+    const int64_t idx    = row*j.width + tid;
+    const bool    active = tid < j.width;
+
+    __shared__ float s_y[n_rot];
+    __shared__ float s_sum[n_rot / WARP_SIZE];
+
+    ggml_cuda_pdl_sync();
+
+    float v = 0.0f;
+    if (active) {
+        if (j.past) {
+            const int     c = idx % j.n_ch;
+            const int64_t t = idx / j.n_ch;
+            float xv[n_conv];
+            float wv[n_conv];
+#pragma unroll
+            for (int k = 0; k < n_conv; ++k) {
+                const int64_t i = t + k;
+                xv[k] = i < n_past ? j.past[(int64_t) c*j.past_stride + i] : j.x[(i - n_past)*j.n_ch + c];
+                wv[k] = j.w[(int64_t) c*n_conv + k];
+            }
+            float sum = 0.0f;
+#pragma unroll
+            for (int k = 0; k < n_conv; ++k) {
+                sum += xv[k]*wv[k];
+            }
+            v = (xv[n_past] + sum)*j.conv_scale; // xv[n_past] is cur[c, t]
+            if (t == j.n_t - 1) {
+#pragma unroll
+                for (int k = 0; k < n_past; ++k) {
+                    j.state[(int64_t) c*n_past + k] = xv[k + 1];
+                }
+            }
+        } else {
+            v = j.x[idx];
+            if (j.scale) {
+                v *= j.scale[(row % j.scale_rows)*j.width + tid];
+            }
+        }
+    }
+
+    if (j.pre != HEPH_ROT_PRE_NONE) {
+        float ss = warp_reduce_sum(v*v);
+        if (tid % WARP_SIZE == 0) {
+            s_sum[tid / WARP_SIZE] = ss;
+        }
+        __syncthreads();
+        ss = 0.0f;
+#pragma unroll
+        for (int k = 0; k < n_rot / WARP_SIZE; ++k) {
+            ss += s_sum[k];
+        }
+        if (j.pre == HEPH_ROT_PRE_CLIP) {
+            v *= fminf(fmaxf(j.thr / (sqrtf(ss) + j.eps), 0.0f), 1.0f);
+        } else {
+            v *= 1.0f / sqrtf(ss / j.width + j.eps);
+        }
+    }
+    if (j.rot == nullptr) {
+        if (active) {
+            j.dst[idx] = v;
+        }
+        return;
+    }
+    s_y[tid] = v;
+    __syncthreads();
+
+    const float * rr = j.rot + (int64_t) tid*n_rot;
+    float acc = 0.0f;
+    for (int k0 = 0; k0 < n_rot; k0 += 16) {
+        float r[16];
+#pragma unroll
+        for (int u = 0; u < 16; ++u) {
+            r[u] = rr[k0 + u];
+        }
+#pragma unroll
+        for (int u = 0; u < 16; ++u) {
+            acc += r[u]*s_y[k0 + u];
+        }
+    }
+    j.dst[idx] = acc;
+}
+
+void ggml_cuda_op_row_jobs(ggml_backend_cuda_context & ctx, const heph_row_jobs & jobs) {
+    GGML_ASSERT(jobs.n >= 1 && jobs.n <= HEPH_ROW_MAX_JOBS);
+    const uint32_t blocks = jobs.job[jobs.n - 1].block_end;
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(blocks, 1, 1), dim3(128, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(row_jobs_f32, lp, jobs);
+}

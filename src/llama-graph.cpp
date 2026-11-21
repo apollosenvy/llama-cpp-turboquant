@@ -4280,8 +4280,13 @@ void llm_graph_context::build_conv_state_store(
         ggml_tensor * s,
         ggml_tensor * conv_x,
             int64_t   n_cols,
-             size_t   offs) const {
+             size_t   offs,
+            ggml_tensor ** deferred) const {
     const auto * mctx_cur = inp->mctx;
+
+    if (deferred) {
+        *deferred = nullptr;
+    }
 
     const int64_t n        = conv_x->ne[0] - n_cols; // n_seq_tokens
     const int64_t channels = conv_x->ne[1];
@@ -4300,7 +4305,12 @@ void llm_graph_context::build_conv_state_store(
                 n_cols*channels, n_seqs,
                 row_size, cell_offs);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, last, cell));
+        ggml_tensor * store = ggml_cpy(ctx0, last, cell);
+        if (deferred) {
+            *deferred = store;
+        } else {
+            ggml_build_forward_expand(gf, store);
+        }
         return;
     }
 

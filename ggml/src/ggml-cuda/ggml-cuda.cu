@@ -5641,6 +5641,246 @@ static int ggml_cuda_try_fuse_normq(ggml_backend_cuda_context * cuda_ctx, ggml_c
     return i_mul - i;
 }
 
+// Post-projection stage: a run of row chains followed by their rotations, all in one launch.
+//   clip unit:  [MUL] SQR SUM_ROWS SQRT SCALE FILL DIV CLAMP MUL                         (Q, relative-bias r)
+//   conv unit:  CONCAT SSM_CONV ADD SCALE (clip chain | RMS_NORM) CPY(state store)        (K, V)
+//   then any MUL_MAT with a dense 128x128 weight on a unit's output                        (Q, K, V rotations)
+struct heph_row_unit {
+    heph_row_job        job;
+    const ggml_tensor * out_pre;   // node the pre stage ends in
+    int                 i_out_pre;
+    ggml_tensor *       out;       // node the job writes: the rotation, or out_pre
+    const ggml_tensor * in[2];     // compute-buffer tensors the job reads: rows or conv residual, conv past
+    const ggml_tensor * wts[2];    // weights it reads besides the rotation
+    ggml_tensor *       cpy;       // conv state store
+    int64_t             n_el;
+    int                 last;
+};
+
+static bool heph_parse_clip_unit(ggml_cgraph * cgraph, int k, heph_row_unit & u) {
+    heph_clip c;
+    if (!heph_parse_clip(cgraph, k, c)) {
+        return false;
+    }
+    const int64_t width = c.x->ne[0];
+    if (width > 128) {
+        return false;
+    }
+    u = {};
+    u.job.x     = (const float *) c.x->data;
+    u.job.width = width;
+    u.job.pre   = HEPH_ROT_PRE_CLIP;
+    u.job.thr   = c.thr;
+    u.job.eps   = c.eps;
+    if (c.scale) {
+        u.job.scale      = (const float *) c.scale->data;
+        u.job.scale_rows = ggml_nelements(c.scale) / width;
+        u.wts[0]         = c.scale;
+    }
+    u.out_pre   = c.out;
+    u.i_out_pre = c.last;
+    u.in[0]     = c.x;
+    u.n_el      = ggml_nelements(c.x);
+    u.last      = c.last;
+    return true;
+}
+
+static bool heph_parse_conv_unit(ggml_cgraph * cgraph, int k, heph_row_unit & u) {
+    ggml_tensor * cat = cgraph->nodes[k];
+    if (cat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cat, 0) != 0 || ggml_node_get_use_count(cgraph, k) != 2 ||
+        (cat->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const ggml_tensor * past = cat->src[0];
+    const ggml_tensor * cur  = heph_strip_views(cat->src[1]);
+    const int64_t n_ch = past->ne[1];
+    const int64_t n_t  = cat->ne[0] - 3;
+    if (past->type != GGML_TYPE_F32 || past->ne[0] != 3 || past->ne[2] != 1 || past->ne[3] != 1 || past->nb[0] != sizeof(float) ||
+        past->nb[1] % sizeof(float) != 0 || !heph_f32c(cur) || n_t < 1 || n_ch % 128 != 0 || cat->ne[1] != n_ch || cat->ne[2] != 1 ||
+        cur->ne[0] != n_ch || ggml_nelements(cur) != n_ch*n_t ||
+        cat->src[1]->ne[0] != n_t || cat->src[1]->ne[1] != n_ch || cat->src[1]->data != cur->data ||
+        cat->src[1]->nb[0] != (size_t) n_ch*sizeof(float) || cat->src[1]->nb[1] != sizeof(float)) {
+        return false;
+    }
+    const int i_conv = heph_next_real(cgraph, k + 1);
+    const int i_add  = i_conv < 0 ? -1 : heph_next_real(cgraph, i_conv + 1);
+    const int i_sc   = i_add < 0 ? -1 : heph_next_real(cgraph, i_add + 1);
+    const int i_pre  = i_sc < 0 ? -1 : heph_next_real(cgraph, i_sc + 1);
+    if (i_pre < 0) {
+        return false;
+    }
+    ggml_tensor * conv = cgraph->nodes[i_conv];
+    ggml_tensor * add  = cgraph->nodes[i_add];
+    ggml_tensor * sc   = cgraph->nodes[i_sc];
+    if (conv->op != GGML_OP_SSM_CONV || conv->src[0] != cat || add->op != GGML_OP_ADD || sc->op != GGML_OP_SCALE || sc->src[0] != add ||
+        ggml_get_op_params_f32(sc, 1) != 0.0f || heph_strip_views(add->src[1]) != conv || add->src[0] != cur) {
+        return false;
+    }
+    const ggml_tensor * w = conv->src[1];
+    if (!heph_f32c(w) || w->ne[0] != 4 || w->ne[1] != n_ch || ggml_nelements(w) != 4*n_ch || ggml_nelements(sc) != n_ch*n_t) {
+        return false;
+    }
+    u = {};
+    int last_pre;
+    ggml_tensor * pre = cgraph->nodes[i_pre];
+    heph_clip c;
+    if (pre->op == GGML_OP_RMS_NORM) {
+        if (heph_strip_views(pre->src[0]) != sc || pre->ne[0] != 128) {
+            return false;
+        }
+        u.job.pre   = HEPH_ROT_PRE_RMS;
+        u.job.eps   = ggml_get_op_params_f32(pre, 0);
+        u.out_pre   = pre;
+        last_pre    = i_pre;
+    } else if (heph_parse_clip(cgraph, i_pre, c)) {
+        if (heph_strip_views(c.x) != sc || c.scale != nullptr || c.x->ne[0] != 128) {
+            return false;
+        }
+        u.job.pre   = HEPH_ROT_PRE_CLIP;
+        u.job.thr   = c.thr;
+        u.job.eps   = c.eps;
+        u.out_pre   = c.out;
+        last_pre    = c.last;
+    } else {
+        return false;
+    }
+    u.i_out_pre = last_pre;
+    const int i_cpy = heph_next_real(cgraph, last_pre + 1);
+    if (i_cpy < 0 || cgraph->nodes[i_cpy]->op != GGML_OP_CPY || !heph_uses_confined(cgraph, i_conv, last_pre)) {
+        return false;
+    }
+    ggml_tensor *       cpy  = cgraph->nodes[i_cpy];
+    const ggml_tensor * last = cpy->src[0];
+    const ggml_tensor * cell = cpy->src[1];
+    if (last->view_src != cat || (const char *) last->data != (const char *) cat->data + n_t*sizeof(float) ||
+        last->ne[0] != 3 || last->ne[1] != n_ch || last->ne[2] != 1 || last->ne[3] != 1 ||
+        last->nb[0] != sizeof(float) || last->nb[1] != cat->nb[1] ||
+        cell->type != GGML_TYPE_F32 || cell->nb[0] != sizeof(float) || cell->ne[0] != 3*n_ch || ggml_nelements(cell) != 3*n_ch ||
+        cpy->data != cell->data) {
+        return false;
+    }
+    u.job.x           = (const float *) cur->data;
+    u.job.past        = (const float *) past->data;
+    u.job.past_stride = past->nb[1] / sizeof(float);
+    u.job.w           = (const float *) w->data;
+    u.job.state       = (float *) cpy->data;
+    u.job.n_ch        = n_ch;
+    u.job.n_t         = n_t;
+    u.job.width       = 128;
+    u.job.conv_scale  = ggml_get_op_params_f32(sc, 0);
+    u.in[0]           = cur;
+    u.in[1]           = past;
+    u.wts[0]          = w;
+    u.cpy             = cpy;
+    u.n_el            = n_ch*n_t;
+    u.last            = i_cpy;
+    return true;
+}
+
+static int ggml_cuda_try_fuse_post_proj(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = heph_fuse_enabled("postproj");
+    const enum ggml_op head = cgraph->nodes[i]->op;
+    if (!enabled || (head != GGML_OP_CONCAT && head != GGML_OP_MUL && head != GGML_OP_SQR)) {
+        return 0;
+    }
+    heph_row_unit units[HEPH_ROW_MAX_JOBS];
+    int n = 0;
+    int k = i;
+    while (n < HEPH_ROW_MAX_JOBS && k >= 0) {
+        const bool ok = cgraph->nodes[k]->op == GGML_OP_CONCAT ? heph_parse_conv_unit(cgraph, k, units[n]) :
+                                                                   heph_parse_clip_unit(cgraph, k, units[n]);
+        if (!ok) {
+            break;
+        }
+        k = heph_next_real(cgraph, units[n].last + 1);
+        ++n;
+    }
+    if (n < 2) {
+        return 0;
+    }
+    int last = units[n - 1].last;
+    const ggml_tensor * rots[HEPH_ROW_MAX_JOBS] = {};
+    while (k >= 0) {
+        ggml_tensor * node = cgraph->nodes[k];
+        if (node->op != GGML_OP_MUL_MAT) {
+            break;
+        }
+        const ggml_tensor * rot = node->src[0];
+        const ggml_tensor * rin = heph_strip_views(node->src[1]);
+        int which = -1;
+        for (int u = 0; u < n; ++u) {
+            if (units[u].out_pre == rin && units[u].out == nullptr) {
+                which = u;
+            }
+        }
+        if (which < 0 || rot->op != GGML_OP_NONE || !heph_f32c(rot) || rot->ne[0] != 128 || rot->ne[1] != 128 || ggml_nelements(rot) != 128*128 ||
+            units[which].job.width != 128 || !heph_f32c(node) || node->ne[0] != 128 || ggml_nelements(node) != units[which].n_el ||
+            ggml_node_get_use_count(cgraph, units[which].i_out_pre) != 1 || (units[which].out_pre->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            break;
+        }
+        units[which].out     = node;
+        units[which].job.rot = (const float *) rot->data;
+        rots[which]          = rot;
+        last = k;
+        k = heph_next_real(cgraph, k + 1);
+    }
+    for (int u = 0; u < n; ++u) {
+        if (units[u].out == nullptr) {
+            units[u].out = const_cast<ggml_tensor *>(units[u].out_pre);
+        }
+        if (!heph_f32c(units[u].out) || ggml_nelements(units[u].out) != units[u].n_el) {
+            return 0;
+        }
+    }
+    // The jobs run concurrently. An output may sit exactly on its own row source (a block reads its row before it writes
+    // it; for a conv over several tokens rows read each other, so not even that), and on nothing else any job reads or writes.
+    for (int a = 0; a < n; ++a) {
+        const ggml_tensor * out = units[a].out;
+        for (int b = 0; b < n; ++b) {
+            for (const ggml_tensor * t : units[b].in) {
+                if (t == nullptr) {
+                    continue;
+                }
+                const bool own_rows = a == b && t == units[b].in[0] && !(units[b].job.past && units[b].job.n_t > 1);
+                if (own_rows ? !heph_alias_ok(out, t) : heph_overlap(out, t)) {
+                    return 0;
+                }
+                if (units[a].cpy && heph_overlap(units[a].cpy, t)) {
+                    return 0;
+                }
+            }
+            for (const ggml_tensor * t : units[b].wts) {
+                if (t && (heph_overlap(out, t) || (units[a].cpy && heph_overlap(units[a].cpy, t)))) {
+                    return 0;
+                }
+            }
+            if (rots[b] && (heph_overlap(out, rots[b]) || (units[a].cpy && heph_overlap(units[a].cpy, rots[b])))) {
+                return 0;
+            }
+            if (a != b && heph_overlap(out, units[b].out)) {
+                return 0;
+            }
+            if (units[b].cpy && heph_overlap(out, units[b].cpy)) {
+                return 0;
+            }
+            if (a != b && units[a].cpy && units[b].cpy && heph_overlap(units[a].cpy, units[b].cpy)) {
+                return 0;
+            }
+        }
+    }
+    heph_row_jobs jobs = {};
+    jobs.n = n;
+    uint32_t blocks = 0;
+    for (int u = 0; u < n; ++u) {
+        jobs.job[u]     = units[u].job;
+        jobs.job[u].dst = (float *) units[u].out->data;
+        blocks         += units[u].n_el / units[u].job.width;
+        jobs.job[u].block_end = blocks;
+    }
+    ggml_cuda_op_row_jobs(*cuda_ctx, jobs);
+    return last - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -5651,6 +5891,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     ggml_tensor * node = cgraph->nodes[i];
 
     if (cuda_ctx->stream_context().concurrent_events.empty()) {
+        if (const int n = ggml_cuda_try_fuse_post_proj(cuda_ctx, cgraph, i)) {
+            ++ggml_cuda_heph_fuse_count;
+            return n;
+        }
         if (const int n = ggml_cuda_try_fuse_mmv_group(cuda_ctx, cgraph, i)) {
             ++ggml_cuda_heph_fuse_count;
             return n;

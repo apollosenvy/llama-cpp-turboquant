@@ -86,3 +86,34 @@ void ggml_cuda_op_mmv_q8_0_multi(ggml_backend_cuda_context & ctx, ggml_tensor **
 // rms_norm(x)*w for one vector, F32 result plus its q8_1 form written to q8_1
 void ggml_cuda_op_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w, ggml_tensor * dst,
                                   void * q8_1, float eps);
+
+// Row jobs: up to four independent row-wise chains in one launch, one block of 128 threads per row.
+//   source: rows of `width` elements from x (times an optional scale), or the convolve() tail
+//           (cur + sum_j x4[t + j, c]*w[j, c])*conv_scale with x4 = [past | cur], which also stores the next conv state
+//   pre:    none, clip to an L2 norm of thr, or rms_norm
+//   rot:    optional dense 128x128 product (width 128 only)
+#define HEPH_ROW_MAX_JOBS 4
+struct heph_row_job {
+    const float * x;           // row source, or the conv residual cur [n_ch, n_t]
+    const float * scale;       // optional, scale_rows rows of width elements, cycled
+    const float * past;        // conv: [3, n_ch] with a column stride of past_stride elements
+    const float * w;           // conv taps [4, n_ch]
+    const float * rot;         // optional [128, 128]
+    float *       dst;
+    float *       state;       // conv: next state, [3, n_ch] dense
+    int64_t       past_stride;
+    uint32_t      block_end;   // one past the last row block of the job
+    int           scale_rows;
+    int           n_ch;
+    int           n_t;
+    int           width;
+    int           pre;         // HEPH_ROT_PRE_*
+    float         conv_scale;
+    float         thr;
+    float         eps;
+};
+struct heph_row_jobs {
+    heph_row_job job[HEPH_ROW_MAX_JOBS];
+    int          n;
+};
+void ggml_cuda_op_row_jobs(ggml_backend_cuda_context & ctx, const heph_row_jobs & jobs);
