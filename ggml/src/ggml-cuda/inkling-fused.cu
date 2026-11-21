@@ -64,3 +64,86 @@ void ggml_cuda_op_clip_rows(ggml_backend_cuda_context & ctx, const ggml_tensor *
         ggml_cuda_kernel_launch(clip_rows_f32<128>, lp, (const float *) x->data, scale_d, (float *) dst->data, ncols, scale_rows, thr, eps, post_scale);
     }
 }
+
+#define HEPH_MIX_BLOCK 256
+
+static __global__ void mix_states_f32(const heph_mix_states states, const int n_states, const float * query, float * dst,
+                                      const int n_embd, const int nq, const float eps, const float sm_scale) {
+    ggml_cuda_pdl_lc();
+    const int q   = blockIdx.x;
+    const int t   = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    constexpr int n_warps = HEPH_MIX_BLOCK / WARP_SIZE;
+    __shared__ float s_ss[HEPH_MIX_MAX_STATES][n_warps];
+    __shared__ float s_dt[HEPH_MIX_MAX_STATES][n_warps];
+
+    const float * qv = query + (int64_t) q*n_embd;
+
+    ggml_cuda_pdl_sync();
+
+    for (int s = 0; s < n_states; ++s) {
+        const float * x = states.p[s] + (int64_t) t*n_embd;
+        float ss = 0.0f;
+        float dt = 0.0f;
+        for (int e = tid; e < n_embd; e += HEPH_MIX_BLOCK) {
+            const float v = x[e];
+            ss += v*v;
+            dt += v*qv[e];
+        }
+        ss = warp_reduce_sum(ss);
+        dt = warp_reduce_sum(dt);
+        if (tid % WARP_SIZE == 0) {
+            s_ss[s][tid / WARP_SIZE] = ss;
+            s_dt[s][tid / WARP_SIZE] = dt;
+        }
+    }
+    __syncthreads();
+
+    // every thread finishes the reduction and the softmax itself, n_states is tiny
+    float w[HEPH_MIX_MAX_STATES]; // rms scale of each state, then its final weight
+    float l[HEPH_MIX_MAX_STATES]; // softmax logits
+    float max_val = -INFINITY;
+    for (int s = 0; s < n_states; ++s) {
+        float ss = 0.0f;
+        float dt = 0.0f;
+        for (int k = 0; k < n_warps; ++k) {
+            ss += s_ss[s][k];
+            dt += s_dt[s][k];
+        }
+        w[s]    = 1.0f / sqrtf(ss / n_embd + eps);
+        l[s]    = dt*w[s]*sm_scale;
+        max_val = fmaxf(max_val, l[s]);
+    }
+    float sum = 0.0f;
+    for (int s = 0; s < n_states; ++s) {
+        l[s] = expf(l[s] - max_val);
+        sum += l[s];
+    }
+    for (int s = 0; s < n_states; ++s) {
+        w[s] *= l[s] / sum;
+    }
+
+    float * out = dst + ((int64_t) t*nq + q)*n_embd;
+    for (int e = tid; e < n_embd; e += HEPH_MIX_BLOCK) {
+        float acc = 0.0f;
+        for (int s = 0; s < n_states; ++s) {
+            acc += w[s]*states.p[s][(int64_t) t*n_embd + e];
+        }
+        out[e] = acc;
+    }
+}
+
+void ggml_cuda_op_mix_states(ggml_backend_cuda_context & ctx, const heph_mix_states & states, int n_states,
+                             const ggml_tensor * query, ggml_tensor * dst, float eps, float sm_scale) {
+    GGML_ASSERT(n_states >= 1 && n_states <= HEPH_MIX_MAX_STATES);
+    GGML_ASSERT(query->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(query) && ggml_is_contiguous(dst));
+
+    const int n_embd = dst->ne[0];
+    const int nq     = dst->ne[1];
+    const int nt     = dst->ne[2];
+    GGML_ASSERT(query->ne[0] == n_embd && query->ne[1] == nq);
+
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(nq, nt, 1), dim3(HEPH_MIX_BLOCK, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(mix_states_f32, lp, states, n_states, (const float *) query->data, (float *) dst->data, n_embd, nq, eps, sm_scale);
+}

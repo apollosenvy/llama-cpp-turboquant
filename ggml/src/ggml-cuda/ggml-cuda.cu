@@ -4468,6 +4468,8 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
 // ---- HEPH: glue-chain fusions for op-heavy decode graphs (Inkling 2) ----
 
+extern "C" { GGML_API int ggml_cuda_heph_fuse_count = 0; }
+
 static bool heph_fuse_enabled(const char * name) {
     // GGML_CUDA_HEPH_FUSE=0 disables all; GGML_CUDA_HEPH_NOFUSE=clip,mix,... disables by name
     static const char * all = getenv("GGML_CUDA_HEPH_FUSE");
@@ -4566,6 +4568,144 @@ static int ggml_cuda_try_fuse_clip_rows(ggml_backend_cuda_context * cuda_ctx, gg
     return count - 1;
 }
 
+// true if every node in [first, last) is used only by nodes in (itself, last]
+static bool heph_uses_confined(const ggml_cgraph * cgraph, int first, int last) {
+    for (int k = first; k < last; ++k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (n->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return false;
+        }
+        int uses = 0;
+        for (int j = k + 1; j <= last; ++j) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                uses += cgraph->nodes[j]->src[s] == n;
+            }
+        }
+        if (uses != ggml_node_get_use_count(cgraph, k)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// next node at or after idx that launches a kernel, or -1
+static int heph_next_real(const ggml_cgraph * cgraph, int idx) {
+    while (idx < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[idx])) {
+        ++idx;
+    }
+    return idx < cgraph->n_nodes ? idx : -1;
+}
+
+static const ggml_tensor * heph_strip_views(const ggml_tensor * t) {
+    while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE)) {
+        t = t->src[0];
+    }
+    return t;
+}
+
+// mix(): [CONCAT ...] RMS_NORM CONT REPEAT MUL_MAT SOFT_MAX MUL_MAT, with reshapes and transposes between
+static int ggml_cuda_try_fuse_mix(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = heph_fuse_enabled("mix");
+    if (!enabled) {
+        return 0;
+    }
+    ggml_tensor * head = cgraph->nodes[i];
+    if (head->op != GGML_OP_CONCAT && head->op != GGML_OP_RMS_NORM) {
+        return 0;
+    }
+
+    int k = i;
+    while (k >= 0 && cgraph->nodes[k]->op == GGML_OP_CONCAT) {
+        if (ggml_get_op_params_i32(cgraph->nodes[k], 0) != 1) {
+        return 0;
+    }
+        k = heph_next_real(cgraph, k + 1);
+    }
+    const int i_rms = k;
+    const int i_cont = i_rms  < 0 ? -1 : heph_next_real(cgraph, i_rms  + 1);
+    const int i_rep  = i_cont < 0 ? -1 : heph_next_real(cgraph, i_cont + 1);
+    const int i_mm1  = i_rep  < 0 ? -1 : heph_next_real(cgraph, i_rep  + 1);
+    const int i_sm   = i_mm1  < 0 ? -1 : heph_next_real(cgraph, i_mm1  + 1);
+    const int i_mm2  = i_sm   < 0 ? -1 : heph_next_real(cgraph, i_sm   + 1);
+    if (i_mm2 < 0) {
+        return 0;
+    }
+
+    ggml_tensor * rms  = cgraph->nodes[i_rms];
+    ggml_tensor * cont = cgraph->nodes[i_cont];
+    ggml_tensor * rep  = cgraph->nodes[i_rep];
+    ggml_tensor * mm1  = cgraph->nodes[i_mm1];
+    ggml_tensor * sm   = cgraph->nodes[i_sm];
+    ggml_tensor * mm2  = cgraph->nodes[i_mm2];
+
+    if (rms->op != GGML_OP_RMS_NORM || cont->op != GGML_OP_CONT || rep->op != GGML_OP_REPEAT || mm1->op != GGML_OP_MUL_MAT ||
+        sm->op != GGML_OP_SOFT_MAX || mm2->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+    // edges: cont = cont(transpose(rms)); mm1 = rms x rep; sm = softmax(mm1); mm2 = cont x sm
+    if (cont->src[0]->op != GGML_OP_TRANSPOSE || cont->src[0]->src[0] != rms || mm1->src[0] != rms || mm1->src[1] != rep ||
+        sm->src[0] != mm1 || sm->src[1] != nullptr || mm2->src[0] != cont || mm2->src[1] != sm) {
+        return 0;
+    }
+    if (ggml_get_op_params_f32(sm, 1) != 0.0f) {
+        return 0;
+    }
+
+    const ggml_tensor * query = rep->src[0];
+    const int64_t n_embd = rms->ne[0];
+    const int64_t n_s    = rms->ne[1];
+    const int64_t nt     = rms->ne[2];
+    const int64_t nq     = rep->ne[1];
+    if (n_s > HEPH_MIX_MAX_STATES || rms->ne[3] != 1 || rms->type != GGML_TYPE_F32 || mm2->type != GGML_TYPE_F32 ||
+        query->type != GGML_TYPE_F32 || !ggml_is_contiguous(query) || query->ne[0] != n_embd || query->ne[1] != nq ||
+        query->ne[2] != 1 || rep->ne[0] != n_embd || rep->ne[2] != nt ||
+        mm2->ne[0] != n_embd || mm2->ne[1] != nq || mm2->ne[2] != nt || !ggml_is_contiguous(mm2)) {
+        return 0;
+    }
+
+    // collect the states: the concat chain is concat(block_k, concat(..., concat(block_0, cur))) along dim 1
+    heph_mix_states states = {};
+    int n_states = 0;
+    const ggml_tensor * cur = rms->src[0];
+    int n_concat = 0;
+    while (true) {
+        const ggml_tensor * leaf = cur;
+        const ggml_tensor * rest = nullptr;
+        if (cur->op == GGML_OP_CONCAT && head->op == GGML_OP_CONCAT && n_concat < n_s - 1) {
+            leaf = cur->src[0];
+            rest = cur->src[1];
+            ++n_concat;
+        }
+        if (leaf->type != GGML_TYPE_F32 || !ggml_is_contiguous(leaf) || leaf->ne[0] != n_embd || leaf->ne[1] != 1 ||
+            leaf->ne[2] != nt || leaf->ne[3] != 1 || n_states >= HEPH_MIX_MAX_STATES) {
+        return 0;
+    }
+        // an exact alias is safe for one query: all reads of a column finish before its only write
+        if (heph_overlap(mm2, leaf) && !(nq == 1 && mm2->data == leaf->data)) {
+        return 0;
+    }
+        states.p[n_states++] = (const float *) leaf->data;
+        if (!rest) {
+            break;
+        }
+        cur = rest;
+    }
+    if (n_states != n_s || heph_overlap(mm2, query)) {
+        return 0;
+    }
+    // the concats found by walking back from rms must be exactly the ones in [i, i_rms)
+    int n_concat_fwd = 0;
+    for (int j = i; j < i_rms; ++j) {
+        n_concat_fwd += cgraph->nodes[j]->op == GGML_OP_CONCAT;
+    }
+    if (n_concat_fwd != n_concat || !heph_uses_confined(cgraph, i, i_mm2)) {
+        return 0;
+    }
+
+    ggml_cuda_op_mix_states(*cuda_ctx, states, n_states, query, mm2, ggml_get_op_params_f32(rms, 0), ggml_get_op_params_f32(sm, 0));
+    return i_mm2 - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4577,6 +4717,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (cuda_ctx->stream_context().concurrent_events.empty()) {
         if (const int n = ggml_cuda_try_fuse_clip_rows(cuda_ctx, cgraph, i)) {
+            ++ggml_cuda_heph_fuse_count;
+            return n;
+        }
+        if (const int n = ggml_cuda_try_fuse_mix(cuda_ctx, cgraph, i)) {
+            ++ggml_cuda_heph_fuse_count;
             return n;
         }
     }
