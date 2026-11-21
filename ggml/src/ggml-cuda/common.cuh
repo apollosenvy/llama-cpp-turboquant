@@ -445,6 +445,27 @@ static __device__ __forceinline__ T ggml_cuda_shfl_up(T value, unsigned delta, i
 
 template <typename T>
 static __device__ __forceinline__ T ggml_cuda_shfl_xor(T value, int lane_mask, int width = ggml_cuda_get_physical_warp_size(), ggml_cuda_thread_mask_t mask = GGML_CUDA_FULL_THREAD_MASK) {
+#if defined(GGML_USE_HIP) && defined(RDNA)
+    // RDNA: the two lanes a xor mask of 1, 2, 4 or 8 pairs up sit in the same row of 16, so the swap is a register
+    // permute (DPP) and does not go through LDS as the ds_bpermute of __shfl_xor does. The lanes read are the same,
+    // so results do not change. A reduction over a wave is then four permutes and one ds_bpermute instead of five.
+    if constexpr (sizeof(T) == 4) {
+        if (mask == GGML_CUDA_FULL_THREAD_MASK && width > lane_mask && (width & (width - 1)) == 0) {
+            const unsigned x = __builtin_bit_cast(unsigned, value);
+            switch (lane_mask) {
+                case 1: return __builtin_bit_cast(T, __builtin_amdgcn_mov_dpp(x, 0xB1, 0xf, 0xf, false)); // swap neighbours
+                case 2: return __builtin_bit_cast(T, __builtin_amdgcn_mov_dpp(x, 0x4E, 0xf, 0xf, false)); // swap pairs
+                case 4: {
+                    // row shifts by four lanes, each written to every second group of four
+                    const unsigned lo = __builtin_amdgcn_update_dpp(x, x, 0x104, 0xf, 0x5, false);
+                    return __builtin_bit_cast(T, __builtin_amdgcn_update_dpp(lo, x, 0x114, 0xf, 0xA, false));
+                }
+                case 8: return __builtin_bit_cast(T, __builtin_amdgcn_mov_dpp(x, 0x128, 0xf, 0xf, false)); // rotate the row by 8
+                default: break;
+            }
+        }
+    }
+#endif // defined(GGML_USE_HIP) && defined(RDNA)
     return __shfl_xor_sync(mask, value, lane_mask, width);
 }
 
