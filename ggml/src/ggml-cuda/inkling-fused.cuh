@@ -89,7 +89,8 @@ void ggml_cuda_op_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, const ggml_te
 
 // Row jobs: up to four independent row-wise chains in one launch, one block of 128 threads per row.
 //   source: rows of `width` elements from x (times an optional scale), or the convolve() tail
-//           (cur + sum_j x4[t + j, c]*w[j, c])*conv_scale with x4 = [past | cur], which also stores the next conv state
+//           (cur + sum_j x4[t + j, c]*(w[j, c] + dyn[n_conv - 1 - j, c/128, t]))*conv_scale with x4 = [past | cur],
+//           which also stores the next conv state; dyn are the optional input-dependent taps
 //   pre:    none, clip to an L2 norm of thr, or rms_norm
 //   rot:    optional dense 128x128 product (width 128 only)
 //   store:  optionally the rotated row is also packed into a turbo3 KV cache block, as SET_ROWS would
@@ -102,6 +103,10 @@ struct heph_row_job {
     const float * rot;         // optional [128, 128]
     float *       dst;
     float *       state;       // conv: next state, [3, n_ch] dense
+    const float * dyn;         // conv: optional input-dependent taps [n_conv*heads, n_t], added to w per head (128 channels)
+    const float * post;        // optional factor per token applied after pre (log-scaled position), rows_per_token rows each
+    int           dyn_stride;  // taps per token
+    int           rows_per_token;
     void *        t3;          // optional turbo3 cache to store the rotated rows in (SET_ROWS), one block per row
     const int64_t * t3_idx;    // cache row of each token
     int64_t       t3_row_bytes;

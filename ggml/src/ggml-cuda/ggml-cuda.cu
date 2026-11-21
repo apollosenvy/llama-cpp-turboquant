@@ -5651,7 +5651,7 @@ struct heph_row_unit {
     const ggml_tensor * out_pre;   // node the pre stage ends in
     int                 i_out_pre;
     ggml_tensor *       out;       // node the job writes: the rotation, or out_pre
-    const ggml_tensor * in[2];     // compute-buffer tensors the job reads: rows or conv residual, conv past
+    const ggml_tensor * in[4];     // compute-buffer tensors the job reads: rows or conv residual, conv past, taps, token factor
     const ggml_tensor * wts[2];    // weights it reads besides the rotation
     ggml_tensor *       cpy;       // conv state store
     int64_t             n_el;
@@ -5683,13 +5683,28 @@ static bool heph_parse_clip_unit(ggml_cgraph * cgraph, int k, heph_row_unit & u)
     u.in[0]     = c.x;
     u.n_el      = ggml_nelements(c.x);
     u.last      = c.last;
+    // full-attention layers scale the clipped rows by a factor per token: MUL(clip, [1, 1, n_tokens])
+    const int i_post = heph_next_real(cgraph, c.last + 1);
+    if (i_post >= 0 && cgraph->nodes[i_post]->op == GGML_OP_MUL && ggml_node_get_use_count(cgraph, c.last) == 1 &&
+        !(c.out->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        ggml_tensor *       mul = cgraph->nodes[i_post];
+        const ggml_tensor * f   = mul->src[0] == c.out ? mul->src[1] : mul->src[1] == c.out ? mul->src[0] : nullptr;
+        if (f && f != c.out && heph_f32c(f) && f->ne[0] == 1 && f->ne[1] == 1 && f->ne[2] == c.x->ne[2] && f->ne[3] == 1 &&
+            heph_f32c(mul) && ggml_are_same_shape(mul, c.out)) {
+            u.job.post           = (const float *) f->data;
+            u.job.rows_per_token = c.x->ne[1];
+            u.in[3]              = f;
+            u.out_pre            = mul;
+            u.i_out_pre          = i_post;
+            u.last               = i_post;
+        }
+    }
     return true;
 }
 
 static bool heph_parse_conv_unit(ggml_cgraph * cgraph, int k, heph_row_unit & u) {
     ggml_tensor * cat = cgraph->nodes[k];
-    if (cat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cat, 0) != 0 || ggml_node_get_use_count(cgraph, k) != 2 ||
-        (cat->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+    if (cat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cat, 0) != 0 || (cat->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return false;
     }
     const ggml_tensor * past = cat->src[0];
@@ -5704,17 +5719,62 @@ static bool heph_parse_conv_unit(ggml_cgraph * cgraph, int k, heph_row_unit & u)
         return false;
     }
     const int i_conv = heph_next_real(cgraph, k + 1);
-    const int i_add  = i_conv < 0 ? -1 : heph_next_real(cgraph, i_conv + 1);
+    if (i_conv < 0 || cgraph->nodes[i_conv]->op != GGML_OP_SSM_CONV || cgraph->nodes[i_conv]->src[0] != cat) {
+        return false;
+    }
+    ggml_tensor * conv = cgraph->nodes[i_conv];
+    // Input-dependent taps (full-attention layers), one term per lag: CONT(window) MUL(tap) ADD.
+    // The window of lag l is the concat shifted by n_conv - 1 - l columns, its tap is dyn[l, head, token].
+    const ggml_tensor * dyn = nullptr;
+    const ggml_tensor * acc = conv; // running sum the next term adds to
+    int i_at = heph_next_real(cgraph, i_conv + 1);
+    for (int lag = 0; lag < 4 && i_at >= 0 && cgraph->nodes[i_at]->op == GGML_OP_CONT; ++lag) {
+        const int i_mul = heph_next_real(cgraph, i_at + 1);
+        const int i_sum = i_mul < 0 ? -1 : heph_next_real(cgraph, i_mul + 1);
+        if (i_sum < 0) {
+            return false;
+        }
+        const ggml_tensor * cont = cgraph->nodes[i_at];
+        const ggml_tensor * mul  = cgraph->nodes[i_mul];
+        const ggml_tensor * sum  = cgraph->nodes[i_sum];
+        const ggml_tensor * win  = cont->src[0]; // transposed window view of the concat
+        if (mul->op != GGML_OP_MUL || sum->op != GGML_OP_ADD || heph_strip_views(mul->src[0]) != cont ||
+            heph_strip_views(sum->src[0]) != acc || heph_strip_views(sum->src[1]) != mul ||
+            win->view_src != cat || (const char *) win->data != (const char *) cat->data + (3 - lag)*sizeof(float) ||
+            ggml_nelements(cont) != n_ch*n_t || cont->ne[0] != n_ch) {
+            return false;
+        }
+        const ggml_tensor * tap  = mul->src[1];
+        const ggml_tensor * base = tap->view_src;
+        if (base == nullptr || !heph_f32c(base) || base->ne[0] % 4 != 0 || base->ne[0]/4*128 != n_ch || ggml_nelements(base) != base->ne[0]*n_t ||
+            (dyn != nullptr && base != dyn) || (const char *) tap->data != (const char *) base->data + lag*sizeof(float) ||
+            tap->ne[0] != 1 || tap->ne[1] != base->ne[0]/4 || tap->ne[2] != n_t || tap->nb[1] != 4*sizeof(float) ||
+            tap->nb[2] != (size_t) base->ne[0]*sizeof(float)) {
+            return false;
+        }
+        dyn  = base;
+        acc  = sum;
+        i_at = heph_next_real(cgraph, i_sum + 1);
+        if (lag == 3) {
+            break;
+        }
+        if (i_at < 0 || cgraph->nodes[i_at]->op != GGML_OP_CONT) {
+            return false; // all four lags or none
+        }
+    }
+    if (ggml_node_get_use_count(cgraph, k) != (dyn ? 6 : 2)) {
+        return false;
+    }
+    const int i_add  = i_at;
     const int i_sc   = i_add < 0 ? -1 : heph_next_real(cgraph, i_add + 1);
     const int i_pre  = i_sc < 0 ? -1 : heph_next_real(cgraph, i_sc + 1);
     if (i_pre < 0) {
         return false;
     }
-    ggml_tensor * conv = cgraph->nodes[i_conv];
     ggml_tensor * add  = cgraph->nodes[i_add];
     ggml_tensor * sc   = cgraph->nodes[i_sc];
-    if (conv->op != GGML_OP_SSM_CONV || conv->src[0] != cat || add->op != GGML_OP_ADD || sc->op != GGML_OP_SCALE || sc->src[0] != add ||
-        ggml_get_op_params_f32(sc, 1) != 0.0f || heph_strip_views(add->src[1]) != conv || add->src[0] != cur) {
+    if (add->op != GGML_OP_ADD || sc->op != GGML_OP_SCALE || sc->src[0] != add ||
+        ggml_get_op_params_f32(sc, 1) != 0.0f || heph_strip_views(add->src[1]) != acc || add->src[0] != cur) {
         return false;
     }
     const ggml_tensor * w = conv->src[1];
@@ -5769,6 +5829,11 @@ static bool heph_parse_conv_unit(ggml_cgraph * cgraph, int k, heph_row_unit & u)
     u.job.n_t         = n_t;
     u.job.width       = 128;
     u.job.conv_scale  = ggml_get_op_params_f32(sc, 0);
+    if (dyn) {
+        u.job.dyn        = (const float *) dyn->data;
+        u.job.dyn_stride = dyn->ne[0];
+        u.in[2]          = dyn;
+    }
     u.in[0]           = cur;
     u.in[1]           = past;
     u.wts[0]          = w;

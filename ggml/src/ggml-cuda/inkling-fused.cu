@@ -887,6 +887,14 @@ static __global__ void row_jobs_f32(const heph_row_jobs jobs) {
                 xv[k] = i < n_past ? j.past[(int64_t) c*j.past_stride + i] : j.x[(i - n_past)*j.n_ch + c];
                 wv[k] = j.w[(int64_t) c*n_conv + k];
             }
+            if (j.dyn) {
+                // lag l of the taps weighs the input n_conv - 1 - l steps back, the same tap for the 128 channels of a head
+                const float * dt = j.dyn + t*j.dyn_stride + (int64_t) (c / n_rot)*n_conv;
+#pragma unroll
+                for (int k = 0; k < n_conv; ++k) {
+                    wv[k] += dt[n_conv - 1 - k];
+                }
+            }
             float sum = 0.0f;
 #pragma unroll
             for (int k = 0; k < n_conv; ++k) {
@@ -923,6 +931,9 @@ static __global__ void row_jobs_f32(const heph_row_jobs jobs) {
         } else {
             v *= 1.0f / sqrtf(ss / j.width + j.eps);
         }
+    }
+    if (j.post) {
+        v *= j.post[row / j.rows_per_token];
     }
     if (j.rot == nullptr) {
         if (active) {
