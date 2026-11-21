@@ -6290,8 +6290,11 @@ static int ggml_cuda_try_fuse_moe_route(ggml_backend_cuda_context * cuda_ctx, gg
             return 0;
         }
     }
+    // One block per token reads its logits before it writes anything. With one token the outputs may therefore sit on
+    // the logits (the allocator does place the ids there); with several, another token's block may still be reading.
     if (ggml_node_get_use_count(cgraph, i) != 2 || ((sig->flags | rows->flags) & GGML_TENSOR_FLAG_OUTPUT) ||
-        heph_overlap(out, logits) || heph_overlap(arg, logits) || heph_overlap(out, bias) || heph_overlap(arg, bias) || heph_overlap(out, arg)) {
+        (n_tokens > 1 && (heph_overlap(out, logits) || heph_overlap(arg, logits))) ||
+        heph_overlap(out, bias) || heph_overlap(arg, bias) || heph_overlap(out, arg)) {
         return 0;
     }
     ggml_cuda_op_moe_route(*cuda_ctx, logits, bias, arg->data, arg->nb[1] / sizeof(int32_t), out, n_used,
