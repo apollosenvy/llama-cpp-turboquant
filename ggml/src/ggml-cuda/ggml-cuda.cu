@@ -5557,6 +5557,62 @@ static int ggml_cuda_try_fuse_rel_op_fill(ggml_backend_cuda_context * cuda_ctx, 
     return i_fill - i;
 }
 
+// A run of MUL_MAT nodes with Q8_0 weights and single-vector inputs: one launch for all of them.
+// The inputs are read through their q8_1 copies, made before the launch, so where the allocator put the outputs
+// relative to the inputs does not matter.
+static int ggml_cuda_try_fuse_mmv_group(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = heph_fuse_enabled("mmv");
+    if (!enabled || cgraph->nodes[i]->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+    ggml_tensor * nodes[8];
+    const ggml_tensor * inputs[3];
+    int n = 0;
+    int n_inputs = 0;
+    int last = i;
+    for (int k = i; k >= 0 && n < 8; k = heph_next_real(cgraph, k + 1)) {
+        ggml_tensor * node = cgraph->nodes[k];
+        if (node->op != GGML_OP_MUL_MAT) {
+            break;
+        }
+        const ggml_tensor * w = node->src[0];
+        const ggml_tensor * x = node->src[1];
+        if (w->type != GGML_TYPE_Q8_0 || !ggml_is_contiguous(w) || w->ne[2] != 1 || w->ne[3] != 1 || w->ne[0] % 32 != 0 ||
+            (n > 0 && w->ne[0] != nodes[0]->src[0]->ne[0]) ||
+            x->type != GGML_TYPE_F32 || ggml_nelements(x) != w->ne[0] || x->ne[0] != w->ne[0] ||
+            x->op == GGML_OP_NONE || x->view_src != nullptr || !ggml_is_contiguous(x) ||
+            !heph_f32c(node) || ggml_nelements(node) != w->ne[1] || node->ne[0] != w->ne[1]) {
+            break;
+        }
+        int which = -1;
+        for (int s = 0; s < n_inputs; ++s) {
+            if (inputs[s] == x) {
+                which = s;
+            }
+        }
+        if (which < 0) {
+            if (n_inputs == 3) {
+                break; // the cache keeps four vectors
+            }
+            inputs[n_inputs++] = x;
+        }
+        bool clash = false;
+        for (int j = 0; j < n; ++j) {
+            clash = clash || heph_overlap(node, nodes[j]);
+        }
+        if (clash) {
+            break;
+        }
+        nodes[n++] = node;
+        last = k;
+    }
+    if (n < 2) {
+        return 0;
+    }
+    ggml_cuda_op_mmv_q8_0_multi(*cuda_ctx, nodes, n);
+    return last - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -5567,6 +5623,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     ggml_tensor * node = cgraph->nodes[i];
 
     if (cuda_ctx->stream_context().concurrent_events.empty()) {
+        if (const int n = ggml_cuda_try_fuse_mmv_group(cuda_ctx, cgraph, i)) {
+            ++ggml_cuda_heph_fuse_count;
+            return n;
+        }
         if (const int n = ggml_cuda_try_fuse_conv_state(cuda_ctx, cgraph, i)) {
             ++ggml_cuda_heph_fuse_count;
             return n;
@@ -6454,7 +6514,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
-    cuda_ctx->heph_qcache.key = nullptr; // tensors keep their addresses across evaluations, their contents do not
+    cuda_ctx->heph_qcache.reset(); // tensors keep their addresses across evaluations, their contents do not
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu

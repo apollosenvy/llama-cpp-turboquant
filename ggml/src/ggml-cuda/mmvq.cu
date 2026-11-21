@@ -3,6 +3,7 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 #include "smithy-config.h"
+#include "inkling-fused.cuh"
 
 #include <cstdint>
 #include <type_traits>
@@ -1546,6 +1547,164 @@ static void mul_mat_vec_q_switch_type(
 
 extern "C" { extern int ggml_cuda_heph_fuse_count; }
 
+static bool heph_qcache_enabled() {
+    static const bool on = !(getenv("GGML_CUDA_HEPH_FUSE") && getenv("GGML_CUDA_HEPH_FUSE")[0] == '0') &&
+                           !(getenv("GGML_CUDA_HEPH_NOFUSE") && strstr(getenv("GGML_CUDA_HEPH_NOFUSE"), "qcache"));
+    return on;
+}
+
+// Slot of the q8_1 copy of a single F32 vector, or nullptr if the tensor does not qualify.
+// Only computed, non-view tensors: those are written once, by their own node, and a tensor with pending consumers keeps
+// its buffer untouched. The cache is dropped at the start of every evaluation.
+// quantize: launch the quantize kernel on a miss. Otherwise the caller writes the q8_1 data itself.
+const char * ggml_cuda_heph_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, bool quantize, bool * hit) {
+    using cache = ggml_backend_cuda_context::heph_q8_cache;
+    const int64_t ne10        = src1->ne[0];
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const size_t  q8_1_size   = ne10_padded * sizeof(block_q8_1)/QK8_1;
+    if (hit) {
+        *hit = false;
+    }
+    if (!heph_qcache_enabled() || src1->type != GGML_TYPE_F32 || ggml_nelements(src1) != ne10 || q8_1_size > cache::slot_bytes ||
+        src1->op == GGML_OP_NONE || src1->view_src != nullptr || !ggml_is_contiguous(src1)) {
+        return nullptr;
+    }
+    auto & qc = ctx.heph_qcache;
+    if (qc.buf == nullptr) {
+        CUDA_CHECK(cudaMalloc((void **) &qc.buf, cache::n_slots*cache::slot_bytes));
+    }
+    for (int s = 0; s < cache::n_slots; ++s) {
+        if (qc.slot[s].key == src1 && qc.slot[s].data == src1->data && qc.slot[s].ne10 == ne10) {
+            if (hit) {
+                *hit = true;
+            } else {
+                ++ggml_cuda_heph_fuse_count;
+            }
+            return qc.buf + s*cache::slot_bytes;
+        }
+    }
+    const int s = qc.next;
+    qc.next = (qc.next + 1) % cache::n_slots;
+    char * dst = qc.buf + s*cache::slot_bytes;
+    if (quantize) {
+        quantize_row_q8_1_cuda((const float *) src1->data, dst, ne10, ne10, ne10, ne10, ne10_padded, 1, 1, 1, ctx.stream());
+    }
+    qc.slot[s].key  = src1;
+    qc.slot[s].data = src1->data;
+    qc.slot[s].ne10 = ne10;
+    return dst;
+}
+
+// Several Q8_0 matrix x vector products in one launch. Each job has its own matrix, q8_1 input and output; all
+// matrices have the same row length. 8 warps and 8 rows per block, as mul_mat_vec_q runs these shapes on this card.
+#define HEPH_MMV_MAX_JOBS 8
+struct heph_mmv_jobs {
+    const void * vx[HEPH_MMV_MAX_JOBS];        // Q8_0 rows
+    const void * vy[HEPH_MMV_MAX_JOBS];        // q8_1 input
+    float *      dst[HEPH_MMV_MAX_JOBS];
+    uint32_t     block_end[HEPH_MMV_MAX_JOBS]; // one past the last block of the job
+    uint32_t     nrows[HEPH_MMV_MAX_JOBS];
+    int          n;
+};
+
+static __global__ void mmv_q8_0_multi(const heph_mmv_jobs jobs, const int blocks_per_row) {
+    constexpr int nwarps    = 8;
+    constexpr int rpb       = 8;
+    constexpr int warp_size = WARP_SIZE;
+    constexpr int qk        = ggml_cuda_type_traits<GGML_TYPE_Q8_0>::qk;
+    constexpr int qi        = ggml_cuda_type_traits<GGML_TYPE_Q8_0>::qi;
+    constexpr int vdr       = VDR_Q8_0_Q8_1_MMVQ;
+    constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+
+    ggml_cuda_pdl_lc();
+    int      job    = 0;
+    uint32_t block0 = 0;
+#pragma unroll
+    for (int k = 0; k < HEPH_MMV_MAX_JOBS; ++k) {
+        if (k < jobs.n && blockIdx.x >= jobs.block_end[k]) {
+            job    = k + 1;
+            block0 = jobs.block_end[k];
+        }
+    }
+    if (job >= jobs.n) {
+        return; // a block the launch added to step over a slow grid size
+    }
+    const void *       vx    = jobs.vx[job];
+    const block_q8_1 * y     = (const block_q8_1 *) jobs.vy[job];
+    const uint32_t     nrows = jobs.nrows[job];
+    const uint32_t     row0  = (blockIdx.x - block0)*rpb;
+    const int          tid   = warp_size*threadIdx.y + threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+
+    float tmp[rpb] = { 0.0f };
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kqs = vdr * (tid % (qi/vdr));
+#pragma unroll
+        for (int i = 0; i < rpb; ++i) {
+            // a row past the end of the matrix reads the last row instead, its result is not written
+            const uint32_t row = row0 + i < nrows ? row0 + i : nrows - 1;
+            tmp[i] += vec_dot_q8_0_q8_1(vx, &y[kby], (int) (row*blocks_per_row) + kbx, kqs);
+        }
+    }
+
+    __shared__ float tmp_shared[nwarps - 1][rpb][warp_size];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int i = 0; i < rpb; ++i) {
+            tmp_shared[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) {
+        return;
+    }
+    float * dst = jobs.dst[job] + row0;
+#pragma unroll
+    for (int i = 0; i < rpb; ++i) {
+#pragma unroll
+        for (int l = 0; l < nwarps - 1; ++l) {
+            tmp[i] += tmp_shared[l][i][threadIdx.x];
+        }
+        tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
+        if (threadIdx.x == i && row0 + i < nrows) {
+            dst[i] = tmp[i];
+        }
+    }
+}
+
+// nodes: n MUL_MAT nodes with Q8_0 weights of equal row length and single-vector inputs that all have a q8_1 slot
+void ggml_cuda_op_mmv_q8_0_multi(ggml_backend_cuda_context & ctx, ggml_tensor ** nodes, int n) {
+    GGML_ASSERT(n >= 1 && n <= HEPH_MMV_MAX_JOBS);
+    heph_mmv_jobs jobs = {};
+    jobs.n = n;
+    const int ncols = nodes[0]->src[0]->ne[0];
+    uint32_t  blocks = 0;
+    for (int j = 0; j < n; ++j) {
+        const ggml_tensor * w = nodes[j]->src[0];
+        GGML_ASSERT(w->type == GGML_TYPE_Q8_0 && w->ne[0] == ncols && ncols % QK8_0 == 0);
+        const char * q = ggml_cuda_heph_q8_1(ctx, nodes[j]->src[1], true, nullptr);
+        GGML_ASSERT(q != nullptr);
+        jobs.vx[j]        = w->data;
+        jobs.vy[j]        = q;
+        jobs.dst[j]       = (float *) nodes[j]->data;
+        jobs.nrows[j]     = w->ne[1];
+        blocks           += (w->ne[1] + 7) / 8;
+        jobs.block_end[j] = blocks;
+    }
+    // grids of 379..384 blocks of 256 threads, and the same band below 768, 1152 and 1536, are slow on this card
+    // (HILLCLIMB.md, "Slow launch grid sizes"); a block past the last job returns at once
+    const uint32_t r = blocks % 384;
+    uint32_t grid = blocks;
+    if (blocks <= 1536 && (r == 0 || r >= 379)) {
+        grid = (blocks + 383) / 384 * 384 + 1;
+    }
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(grid, 1, 1), dim3(WARP_SIZE, 8, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(mmv_q8_0_multi, lp, jobs, ncols / QK8_0);
+}
+
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1645,30 +1804,9 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const size_t  q8_1_size   = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
-    const char * src1_q = nullptr;
-    // HEPH: one vector read by several matvecs (Q, relative bias, sinks and gate share their input) is quantized once.
-    // A tensor with pending consumers keeps its buffer untouched, and the cache is dropped at the start of every evaluation.
-    constexpr size_t heph_qcache_bytes = 64*1024;
-    static const bool heph_qcache_on = !(getenv("GGML_CUDA_HEPH_FUSE") && getenv("GGML_CUDA_HEPH_FUSE")[0] == '0') &&
-                                       !(getenv("GGML_CUDA_HEPH_NOFUSE") && strstr(getenv("GGML_CUDA_HEPH_NOFUSE"), "qcache"));
-    // only computed, non-view tensors: those are written once, by their own node
-    if (heph_qcache_on && !ids && ne11 == 1 && ne12 == 1 && ne13 == 1 && q8_1_size <= heph_qcache_bytes &&
-        src1->op != GGML_OP_NONE && src1->view_src == nullptr) {
-        auto & qc = ctx.heph_qcache;
-        if (qc.buf == nullptr) {
-            CUDA_CHECK(cudaMalloc((void **) &qc.buf, heph_qcache_bytes));
-        }
-        if (qc.key == src1 && qc.data == src1->data && qc.ne10 == ne10) {
-            ++ggml_cuda_heph_fuse_count;
-        } else {
-            quantize_row_q8_1_cuda(src1_d, qc.buf, ne10, src1->nb[1] / ts_src1, src1->nb[2] / ts_src1, src1->nb[3] / ts_src1,
-                ne10_padded, ne11, ne12, ne13, stream);
-            qc.key  = src1;
-            qc.data = src1->data;
-            qc.ne10 = ne10;
-        }
-        src1_q = qc.buf;
-    } else {
+    // HEPH: one vector read by several matvecs (Q, relative bias, sinks and gate share their input) is quantized once
+    const char * src1_q = ids ? nullptr : ggml_cuda_heph_q8_1(ctx, src1, true);
+    if (src1_q == nullptr) {
         src1_q8_1.alloc(q8_1_size);
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;

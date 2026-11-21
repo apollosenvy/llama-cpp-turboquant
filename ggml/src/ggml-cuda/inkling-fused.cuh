@@ -75,3 +75,10 @@ struct heph_rot_args {
 };
 // [convolve() tail] -> [clip | rms_norm] -> rotation, rows of 128 elements, 4 convolution taps
 void ggml_cuda_op_rot_rows(ggml_backend_cuda_context & ctx, const heph_rot_args & a, int64_t n_rows);
+
+// q8_1 copy of a single F32 vector in the backend's small cache, or nullptr if the tensor does not qualify.
+// quantize: launch the quantize kernel on a miss (otherwise the caller writes the slot). hit: optional, set on a cache hit.
+const char * ggml_cuda_heph_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, bool quantize, bool * hit = nullptr);
+
+// several Q8_0 matrix x vector products (MUL_MAT nodes) in one launch
+void ggml_cuda_op_mmv_q8_0_multi(ggml_backend_cuda_context & ctx, ggml_tensor ** nodes, int n);

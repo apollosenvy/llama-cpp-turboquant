@@ -336,12 +336,24 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     // self-attention
     {
-        ggml_tensor * Qcur = build_lora_mm(layer.wq, inputs[0]);
-        ggml_tensor * Kcur = convolve(build_lora_mm(layer.wk, inputs[1]), layer.attn_k_conv,
-                is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0);
-        ggml_tensor * Vcur = convolve(build_lora_mm(layer.wv, inputs[2]), layer.attn_v_conv,
-                is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa);
-        ggml_tensor * Rcur = build_lora_mm(layer.attn_rel, inputs[0]);
+        // Every projection of the layer inputs. They go into the graph as one run of nodes, after their inputs, so a
+        // backend can evaluate the whole run in one launch. Node order only.
+        ggml_tensor * Kraw  = build_lora_mm(layer.wk, inputs[1]);
+        ggml_tensor * Vraw  = build_lora_mm(layer.wv, inputs[2]);
+        ggml_tensor * Qcur  = build_lora_mm(layer.wq, inputs[0]);
+        ggml_tensor * Rcur  = build_lora_mm(layer.attn_rel, inputs[0]);
+        ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
+        ggml_tensor * gate  = build_lora_mm(layer.wqkv_gate, inputs[0]);
+        ggml_tensor * Kdyn  = is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]);
+        ggml_tensor * Vdyn  = is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]);
+        for (ggml_tensor * t : { inputs[0], inputs[1], inputs[2], Kraw, Vraw, Qcur, Rcur, sinks, gate, Kdyn, Vdyn }) {
+            if (t) {
+                ggml_build_forward_expand(gf, t);
+            }
+        }
+
+        ggml_tensor * Kcur = convolve(Kraw, layer.attn_k_conv, Kdyn, state, history, recr, 0);
+        ggml_tensor * Vcur = convolve(Vraw, layer.attn_v_conv, Vdyn, state, history, recr, n_embd_k_gqa);
 
         Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, hparams.f_qk_clip);
         Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,           hparams.f_qk_clip);
@@ -363,7 +375,6 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         const int64_t n_stream = (is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
         const int64_t n_kv     = rel_pos->ne[0];
 
-        ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
 
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
         ggml_tensor * mask_raw = (is_swa ? attn->self_attn_mask_swa : attn->self_attn_mask).raw;
@@ -400,7 +411,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                 nullptr, nullptr, nullptr,
                 Qcur, Kcur, Vcur, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il);
 
-        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
+        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
         cb(cur, "attn_out", il);
     }
