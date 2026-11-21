@@ -1706,7 +1706,7 @@ void ggml_cuda_op_mmv_q8_0_multi(ggml_backend_cuda_context & ctx, ggml_tensor **
         jobs.block_end[j] = blocks;
     }
     // grids of 379..384 blocks of 256 threads, and the same band below 768, 1152 and 1536, are slow on this card
-    // (HILLCLIMB.md, "Slow launch grid sizes"); a block past the last job returns at once
+    // (docs/inkling-rx7900xtx.md, "Slow grid sizes"); a block past the last job returns at once
     const uint32_t r = blocks % 384;
     uint32_t grid = blocks;
     if (blocks <= 1536 && (r == 0 || r >= 379)) {

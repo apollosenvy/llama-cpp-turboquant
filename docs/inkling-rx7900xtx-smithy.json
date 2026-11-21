@@ -1,0 +1,1 @@
+{"version": 1, "generator": "kernel-anvil ablate, plus multi-row blocks for Q8_0 matrices of 129..1024 rows", "configs": {"20": {"2,2": {"nwarps": 8, "rows_per_block": 8}}, "8": {"2,2": {"nwarps": 8, "rows_per_block": 8}, "1,2": {"nwarps": 8, "rows_per_block": 8}}}}

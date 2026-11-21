@@ -292,7 +292,7 @@ void ggml_cuda_op_mix_states(ggml_backend_cuda_context & ctx, const heph_mix_sta
 // one block per (gate row, token): gate[g, t] = sum_e w_down[e, g]*a[e, t]*ra + w_down[n + e, g]*b[e, t]*rb
 // with_norm: ra and rb are the rms_norm factors of a and b, recomputed per block; otherwise 1
 // Launches whose total thread count is a multiple of 98,304 (96 compute units x 1024), or up to 1,536 below one, take
-// 6 to 9 us longer on the RX 7900 XTX, up to four multiples (HILLCLIMB.md, "Slow launch grid sizes").
+// 6 to 9 us longer on the RX 7900 XTX, up to four multiples (docs/inkling-rx7900xtx.md, "Slow grid sizes").
 static bool heph_slow_grid(int64_t threads) {
     const int64_t r = threads % 98304;
     return threads <= 4*98304 && (r == 0 || r > 98304 - 1536);
