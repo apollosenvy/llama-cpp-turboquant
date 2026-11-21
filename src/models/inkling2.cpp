@@ -283,9 +283,21 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     const int64_t n_embd_k_gqa = n_embd_head*n_head_kv;
 
     // the message of controller ctrl, [n_embd, n_tokens]
-    auto message = [&](int ctrl) {
-        return ggml_cont(ctx0, ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[2], ctrl*messages->nb[1]));
+    // one column of a [n_embd, n_cols, n_tokens] tensor as [n_embd, n_tokens]; a single token is dense already, no copy
+    auto column = [&](ggml_tensor * t, int col) {
+        if (n_tokens == 1) {
+            return ggml_view_2d(ctx0, t, n_embd, 1, t->nb[1], col*t->nb[1]);
+        }
+        return ggml_cont(ctx0, ggml_view_2d(ctx0, t, n_embd, n_tokens, t->nb[2], col*t->nb[1]));
     };
+    auto message = [&](int ctrl) {
+        return column(messages, ctrl);
+    };
+
+    if (messages) {
+        // evaluate the messages ahead of the layer, so each control() is one unbroken run of nodes. Node order only.
+        ggml_build_forward_expand(gf, messages);
+    }
 
     ggml_tensor * state   = recr->mctx->get_r_l(il);
     ggml_tensor * history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs);
@@ -298,7 +310,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     if (layer.attn_res_query) {
         ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
         for (int j = 0; j < 3; ++j) {
-            inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
+            inputs[j] = column(mixed, is_swa ? 0 : j);
         }
     }
 

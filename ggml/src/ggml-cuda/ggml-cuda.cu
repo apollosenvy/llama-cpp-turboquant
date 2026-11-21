@@ -4905,33 +4905,63 @@ static int ggml_cuda_try_fuse_conv_res_scale(ggml_backend_cuda_context * cuda_ct
 // control() with its inputs: CONT RMS_NORM CONT RMS_NORM | CONCAT MUL_MAT | MUL_MAT TANH MUL SUB | MUL_MAT TANH MUL ADD
 static int ggml_cuda_try_fuse_loop_control_raw(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     static const bool enabled = heph_fuse_enabled("controlraw");
-    if (!enabled || cgraph->nodes[i]->op != GGML_OP_CONT) {
+    if (!enabled || (cgraph->nodes[i]->op != GGML_OP_CONT && cgraph->nodes[i]->op != GGML_OP_RMS_NORM)) {
         return 0;
     }
-    int idx[14] = { i };
-    static const enum ggml_op ops[14] = { GGML_OP_CONT, GGML_OP_RMS_NORM, GGML_OP_CONT, GGML_OP_RMS_NORM,
-                                          GGML_OP_CONCAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB,
+    // [CONT] RMS_NORM [CONT] RMS_NORM, then the fixed chain. cur and msg are either copies made here or tensors from before.
+    int k = i;
+    const auto take_input = [&](ggml_tensor *& holder, ggml_tensor *& rms, bool & copied) {
+        if (k < 0) {
+            return false;
+        }
+        ggml_tensor * n = cgraph->nodes[k];
+        ggml_tensor * cont = nullptr;
+        if (n->op == GGML_OP_CONT) {
+            cont = n;
+            k = heph_next_real(cgraph, k + 1);
+            if (k < 0) {
+                return false;
+            }
+            n = cgraph->nodes[k];
+        }
+        if (n->op != GGML_OP_RMS_NORM || (cont && n->src[0] != cont)) {
+            return false;
+        }
+        rms    = n;
+        holder = n->src[0];
+        copied = cont != nullptr;
+        k = heph_next_real(cgraph, k + 1);
+        return true;
+    };
+    bool a_copied = false;
+    bool b_copied = false;
+    ggml_tensor * ca = nullptr; // what the chain uses as cur and msg
+    ggml_tensor * cb = nullptr;
+    ggml_tensor * ra = nullptr;
+    ggml_tensor * rb = nullptr;
+    if (!take_input(ca, ra, a_copied) || !take_input(cb, rb, b_copied)) {
+        return 0;
+    }
+    int idx[10];
+    static const enum ggml_op ops[10] = { GGML_OP_CONCAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB,
                                           GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
-    for (int k = 1; k < 14; ++k) {
-        idx[k] = heph_next_real(cgraph, idx[k - 1] + 1);
-        if (idx[k] < 0 || cgraph->nodes[idx[k]]->op != ops[k]) {
+    for (int j = 0; j < 10; ++j) {
+        idx[j] = j == 0 ? k : heph_next_real(cgraph, idx[j - 1] + 1);
+        if (idx[j] < 0 || cgraph->nodes[idx[j]]->op != ops[j]) {
             return 0;
         }
     }
-    ggml_tensor * ca   = cgraph->nodes[idx[0]];
-    ggml_tensor * ra   = cgraph->nodes[idx[1]];
-    ggml_tensor * cb   = cgraph->nodes[idx[2]];
-    ggml_tensor * rb   = cgraph->nodes[idx[3]];
-    ggml_tensor * cat  = cgraph->nodes[idx[4]];
-    ggml_tensor * gate = cgraph->nodes[idx[5]];
-    ggml_tensor * mf   = cgraph->nodes[idx[6]];
-    ggml_tensor * tf   = cgraph->nodes[idx[7]];
-    ggml_tensor * fc   = cgraph->nodes[idx[8]];
-    ggml_tensor * sub  = cgraph->nodes[idx[9]];
-    ggml_tensor * mg   = cgraph->nodes[idx[10]];
-    ggml_tensor * tg   = cgraph->nodes[idx[11]];
-    ggml_tensor * gm   = cgraph->nodes[idx[12]];
-    ggml_tensor * add  = cgraph->nodes[idx[13]];
+    const int i_last = idx[9];
+    ggml_tensor * cat  = cgraph->nodes[idx[0]];
+    ggml_tensor * gate = cgraph->nodes[idx[1]];
+    ggml_tensor * mf   = cgraph->nodes[idx[2]];
+    ggml_tensor * tf   = cgraph->nodes[idx[3]];
+    ggml_tensor * fc   = cgraph->nodes[idx[4]];
+    ggml_tensor * sub  = cgraph->nodes[idx[5]];
+    ggml_tensor * mg   = cgraph->nodes[idx[6]];
+    ggml_tensor * tg   = cgraph->nodes[idx[7]];
+    ggml_tensor * gm   = cgraph->nodes[idx[8]];
+    ggml_tensor * add  = cgraph->nodes[idx[9]];
 
     if (ggml_get_op_params_i32(cat, 0) != 0 || ra->src[0] != ca || rb->src[0] != cb || cat->src[0] != ra || cat->src[1] != rb ||
         gate->src[1] != cat || mf->src[1] != gate || tf->src[0] != mf || fc->src[0] != tf || fc->src[1] != ca ||
@@ -4941,8 +4971,9 @@ static int ggml_cuda_try_fuse_loop_control_raw(ggml_backend_cuda_context * cuda_
         return 0;
     }
 
-    const ggml_tensor * a      = ca->src[0]; // strided [n_embd, n_tokens] views
-    const ggml_tensor * b      = cb->src[0];
+    // strided [n_embd, n_tokens] sources: a copy made inside the chain is skipped and its source read instead
+    const ggml_tensor * a      = a_copied ? ca->src[0] : ca;
+    const ggml_tensor * b      = b_copied ? cb->src[0] : cb;
     const ggml_tensor * w_down = gate->src[0];
     const ggml_tensor * w_f    = mf->src[0];
     const ggml_tensor * w_g    = mg->src[0];
@@ -4980,11 +5011,11 @@ static int ggml_cuda_try_fuse_loop_control_raw(ggml_backend_cuda_context * cuda_
     if (add->ne[0] > 3*1024) { // the gate kernel loads three elements per thread
         return 0;
     }
-    if (!heph_uses_confined(cgraph, i, idx[13])) {
+    if (!heph_uses_confined(cgraph, i, i_last)) {
         return 0;
     }
     ggml_cuda_op_loop_control_raw(*cuda_ctx, a, b, ggml_get_op_params_f32(ra, 0), ggml_get_op_params_f32(rb, 0), w_down, w_f, w_g, scratch, add);
-    return idx[13] - i;
+    return i_last - i;
 }
 
 // SUM_ROWS SCALE DIV (reshape) SCALE
