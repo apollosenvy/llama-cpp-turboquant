@@ -4906,10 +4906,26 @@ static int ggml_cuda_try_fuse_conv_res_scale(ggml_backend_cuda_context * cuda_ct
 }
 
 // control() with its inputs: CONT RMS_NORM CONT RMS_NORM | CONCAT MUL_MAT | MUL_MAT TANH MUL SUB | MUL_MAT TANH MUL ADD
-static int ggml_cuda_try_fuse_loop_control_raw(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
-    static const bool enabled = heph_fuse_enabled("controlraw");
-    if (!enabled || (cgraph->nodes[i]->op != GGML_OP_CONT && cgraph->nodes[i]->op != GGML_OP_RMS_NORM)) {
-        return 0;
+struct heph_ctrl_chain {
+    const ggml_tensor * a;        // cur, strided [n_embd, n_tokens]
+    const ggml_tensor * b;        // msg
+    const ggml_tensor * w_down;
+    const ggml_tensor * w_f;
+    const ggml_tensor * w_g;
+    ggml_tensor *       scratch[4]; // buffers of nodes the fusion elides
+    ggml_tensor *       add;      // result
+    float               eps_a;
+    float               eps_b;
+    int64_t             n;
+    int64_t             nt;
+    int64_t             r;
+    int                 last;
+};
+
+// one control() chain starting at node i, including the rms_norm of its two inputs
+static bool heph_parse_control_raw(ggml_cgraph * cgraph, int i, heph_ctrl_chain & c) {
+    if (cgraph->nodes[i]->op != GGML_OP_CONT && cgraph->nodes[i]->op != GGML_OP_RMS_NORM) {
+        return false;
     }
     // [CONT] RMS_NORM [CONT] RMS_NORM, then the fixed chain. cur and msg are either copies made here or tensors from before.
     int k = i;
@@ -4943,7 +4959,7 @@ static int ggml_cuda_try_fuse_loop_control_raw(ggml_backend_cuda_context * cuda_
     ggml_tensor * ra = nullptr;
     ggml_tensor * rb = nullptr;
     if (!take_input(ca, ra, a_copied) || !take_input(cb, rb, b_copied)) {
-        return 0;
+        return false;
     }
     int idx[10];
     static const enum ggml_op ops[10] = { GGML_OP_CONCAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB,
@@ -4951,7 +4967,7 @@ static int ggml_cuda_try_fuse_loop_control_raw(ggml_backend_cuda_context * cuda_
     for (int j = 0; j < 10; ++j) {
         idx[j] = j == 0 ? k : heph_next_real(cgraph, idx[j - 1] + 1);
         if (idx[j] < 0 || cgraph->nodes[idx[j]]->op != ops[j]) {
-            return 0;
+            return false;
         }
     }
     const int i_last = idx[9];
@@ -4971,7 +4987,7 @@ static int ggml_cuda_try_fuse_loop_control_raw(ggml_backend_cuda_context * cuda_
         sub->src[0] != ca || sub->src[1] != fc || mg->src[1] != gate || tg->src[0] != mg || gm->src[0] != tg || gm->src[1] != cb ||
         add->src[0] != sub || add->src[1] != gm ||
         ggml_get_unary_op(tf) != GGML_UNARY_OP_TANH || ggml_get_unary_op(tg) != GGML_UNARY_OP_TANH) {
-        return 0;
+        return false;
     }
 
     // strided [n_embd, n_tokens] sources: a copy made inside the chain is skipped and its source read instead
@@ -4987,7 +5003,7 @@ static int ggml_cuda_try_fuse_loop_control_raw(ggml_backend_cuda_context * cuda_
     for (const ggml_tensor * v : { a, b }) {
         if (v->type != GGML_TYPE_F32 || v->nb[0] != sizeof(float) || v->ne[0] != n || v->ne[1] != nt || v->ne[2] != 1 || v->ne[3] != 1 ||
             v->nb[1] % sizeof(float) != 0) {
-            return 0;
+            return false;
         }
     }
     if (!heph_f32c(w_down) || !heph_f32c(w_f) || !heph_f32c(w_g) || !heph_f32c(gate) || !heph_f32c(cat) || !heph_f32c(add) ||
@@ -4995,33 +5011,110 @@ static int ggml_cuda_try_fuse_loop_control_raw(ggml_backend_cuda_context * cuda_
         w_down->ne[0] != 2*n || w_down->ne[1] != r || ggml_nelements(w_down) != 2*n*r ||
         w_f->ne[0] != r || w_f->ne[1] != n || ggml_nelements(w_f) != n*r || w_g->ne[0] != r || w_g->ne[1] != n || ggml_nelements(w_g) != n*r ||
         ggml_nelements(gate) != r*nt) {
-        return 0;
-    }
-    ggml_tensor * scratch = nullptr;
-    for (ggml_tensor * cand : { gate, cat, ra, rb }) {
-        if (!heph_overlap(cand, a) && !heph_overlap(cand, b) && !heph_overlap(cand, w_down) && !heph_overlap(cand, w_f) &&
-            !heph_overlap(cand, w_g) && !heph_overlap(cand, add)) {
-            scratch = cand;
-            break;
-        }
+        return false;
     }
     // kernel 2 reads cur and msg at strides, so only a dense exact alias is safe
     const bool dense = a->nb[1] == (size_t) n*sizeof(float) && b->nb[1] == (size_t) n*sizeof(float);
-    if (!scratch || heph_overlap(add, w_f) || heph_overlap(add, w_g) ||
+    if (heph_overlap(add, w_f) || heph_overlap(add, w_g) || heph_overlap(add, w_down) ||
         (heph_overlap(add, a) && !(dense && add->data == a->data)) || (heph_overlap(add, b) && !(dense && add->data == b->data))) {
-        return 0;
+        return false;
     }
     if (add->ne[0] > 3*1024) { // the gate kernel loads three elements per thread
-        return 0;
+        return false;
     }
     if (!heph_uses_confined(cgraph, i, i_last)) {
-        return 0;
+        return false;
     }
-    ggml_cuda_op_loop_control_raw(*cuda_ctx, a, b, ggml_get_op_params_f32(ra, 0), ggml_get_op_params_f32(rb, 0), w_down, w_f, w_g, scratch, add);
-    return i_last - i;
+    c = {};
+    c.a = a; c.b = b; c.w_down = w_down; c.w_f = w_f; c.w_g = w_g;
+    c.scratch[0] = gate; c.scratch[1] = cat; c.scratch[2] = ra; c.scratch[3] = rb;
+    c.add   = add;
+    c.eps_a = ggml_get_op_params_f32(ra, 0);
+    c.eps_b = ggml_get_op_params_f32(rb, 0);
+    c.n = n; c.nt = nt; c.r = r;
+    c.last = i_last;
+    return true;
 }
 
-// SUM_ROWS SCALE DIV (reshape) SCALE
+// A run of control() chains (the Q, K and V inputs of a looped layer, or one alone): all gates in one launch,
+// all applies in one launch.
+static int ggml_cuda_try_fuse_loop_control_raw(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = heph_fuse_enabled("controlraw");
+    static const bool grouped = heph_fuse_enabled("ctrlgroup");
+    if (!enabled) {
+        return 0;
+    }
+    heph_ctrl_chain chains[HEPH_CTRL_MAX_JOBS];
+    int n = 0;
+    for (int k = i; k >= 0 && n < HEPH_CTRL_MAX_JOBS; k = heph_next_real(cgraph, chains[n - 1].last + 1)) {
+        if (!heph_parse_control_raw(cgraph, k, chains[n]) ||
+            (n > 0 && (chains[n].n != chains[0].n || chains[n].nt != chains[0].nt || chains[n].r != chains[0].r))) {
+            break;
+        }
+        ++n;
+        if (!grouped) {
+            break;
+        }
+    }
+    // The jobs run concurrently, and every gate is written before any apply reads it. A result may not touch what another
+    // job reads, and a scratch may not touch anything any job reads or writes. Shrink the run until that holds.
+    heph_ctrl_jobs jobs = {};
+    for (; n > 0; --n) {
+        bool ok = true;
+        for (int x = 0; x < n && ok; ++x) {
+            jobs.gate[x] = nullptr;
+            for (ggml_tensor * cand : chains[x].scratch) {
+                bool clear = true;
+                for (int y = 0; y < n && clear; ++y) {
+                    clear = !heph_overlap(cand, chains[y].a) && !heph_overlap(cand, chains[y].b) && !heph_overlap(cand, chains[y].w_down) &&
+                            !heph_overlap(cand, chains[y].w_f) && !heph_overlap(cand, chains[y].w_g) && !heph_overlap(cand, chains[y].add);
+                }
+                // nor the scratch of an earlier job of this run
+                const size_t gate_bytes = chains[0].r*chains[0].nt*sizeof(float);
+                for (int z = 0; z < x && clear; ++z) {
+                    const char * p0 = (const char *) jobs.gate[z];
+                    const char * c0 = (const char *) cand->data;
+                    clear = !(c0 < p0 + gate_bytes && p0 < c0 + ggml_nbytes(cand));
+                }
+                clear = clear && ggml_nbytes(cand) >= gate_bytes;
+                if (clear) {
+                    jobs.gate[x] = (float *) cand->data;
+                    break;
+                }
+            }
+            ok = jobs.gate[x] != nullptr;
+            for (int y = 0; y < n && ok; ++y) {
+                if (y != x) {
+                    ok = !heph_overlap(chains[x].add, chains[y].a) && !heph_overlap(chains[x].add, chains[y].b) &&
+                         !heph_overlap(chains[x].add, chains[y].add);
+                }
+            }
+        }
+        if (ok) {
+            break;
+        }
+    }
+    if (n == 0) {
+        return 0;
+    }
+    jobs.n = n;
+    for (int x = 0; x < n; ++x) {
+        const heph_ctrl_chain & c = chains[x];
+        jobs.cur[x]        = (const float *) c.a->data;
+        jobs.msg[x]        = (const float *) c.b->data;
+        jobs.cur_stride[x] = c.a->nb[1] / sizeof(float);
+        jobs.msg_stride[x] = c.b->nb[1] / sizeof(float);
+        jobs.w_down[x]     = (const float *) c.w_down->data;
+        jobs.w_forget[x]   = (const float *) c.w_f->data;
+        jobs.w_gain[x]     = (const float *) c.w_g->data;
+        jobs.dst[x]        = (float *) c.add->data;
+        jobs.eps_cur[x]    = c.eps_a;
+        jobs.eps_msg[x]    = c.eps_b;
+    }
+    ggml_cuda_op_loop_control_jobs(*cuda_ctx, jobs, chains[0].n, chains[0].nt, chains[0].r);
+    return chains[n - 1].last - i;
+}
+
 static int ggml_cuda_try_fuse_moe_weights_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     static const bool enabled = heph_fuse_enabled("moew");
     ggml_tensor * sum = cgraph->nodes[i];
@@ -5614,15 +5707,22 @@ static int ggml_cuda_try_fuse_mmv_group(ggml_backend_cuda_context * cuda_ctx, gg
 }
 
 // RMS_NORM MUL(weight) on one vector: the kernel also writes the q8_1 form the following matvecs read
-static int ggml_cuda_try_fuse_normq(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
-    static const bool enabled = heph_fuse_enabled("normq");
+struct heph_normq_unit {
+    const ggml_tensor * x;
+    const ggml_tensor * w;
+    ggml_tensor *       mul;
+    float               eps;
+    int                 last;
+};
+
+static bool heph_parse_normq(ggml_cgraph * cgraph, int i, heph_normq_unit & u) {
     ggml_tensor * rms = cgraph->nodes[i];
-    if (!enabled || rms->op != GGML_OP_RMS_NORM) {
-        return 0;
+    if (rms->op != GGML_OP_RMS_NORM) {
+        return false;
     }
     const int i_mul = heph_next_real(cgraph, i + 1);
     if (i_mul < 0 || cgraph->nodes[i_mul]->op != GGML_OP_MUL) {
-        return 0;
+        return false;
     }
     ggml_tensor *       mul = cgraph->nodes[i_mul];
     const ggml_tensor * x   = rms->src[0];
@@ -5631,14 +5731,58 @@ static int ggml_cuda_try_fuse_normq(ggml_backend_cuda_context * cuda_ctx, ggml_c
     if (w == nullptr || w == rms || w->op != GGML_OP_NONE || !heph_f32c(w) || ggml_nelements(w) != n || w->ne[0] != n ||
         !heph_f32c(x) || ggml_nelements(x) != n || x->ne[0] != n || !heph_f32c(mul) || mul->ne[0] != n ||
         GGML_PAD(n, MATRIX_ROW_PADDING) > 3*1024 || heph_overlap(mul, w) || !heph_uses_confined(cgraph, i, i_mul)) {
+        return false;
+    }
+    u = { x, w, mul, ggml_get_op_params_f32(rms, 0), i_mul };
+    return true;
+}
+
+// a run of them (the Q, K and V input norms) is one launch, one block per vector
+static int ggml_cuda_try_fuse_normq(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = heph_fuse_enabled("normq");
+    static const bool grouped = heph_fuse_enabled("normgroup");
+    if (!enabled) {
         return 0;
     }
-    char * q = (char *) ggml_cuda_heph_q8_1(*cuda_ctx, mul, false);
-    if (q == nullptr) {
+    heph_normq_unit units[HEPH_NORMQ_MAX_JOBS];
+    int n = 0;
+    // three at most: with the cache's four slots the vectors of a run stay resident together
+    for (int k = i; k >= 0 && n < 3; k = heph_next_real(cgraph, units[n - 1].last + 1)) {
+        if (!heph_parse_normq(cgraph, k, units[n]) || (n > 0 && ggml_nelements(units[n].mul) != ggml_nelements(units[0].mul))) {
+            break;
+        }
+        // a block reads its whole vector before it writes, so a result may sit on its own input but not on another job's
+        bool clash = false;
+        for (int y = 0; y < n; ++y) {
+            clash = clash || heph_overlap(units[n].mul, units[y].x) || heph_overlap(units[n].mul, units[y].mul) ||
+                    heph_overlap(units[y].mul, units[n].x);
+        }
+        if (clash) {
+            break;
+        }
+        ++n;
+        if (!grouped) {
+            break;
+        }
+    }
+    if (n == 0) {
         return 0;
     }
-    ggml_cuda_op_rms_norm_mul_q8(*cuda_ctx, x, w, mul, q, ggml_get_op_params_f32(rms, 0));
-    return i_mul - i;
+    heph_normq_jobs jobs = {};
+    jobs.n = n;
+    for (int x = 0; x < n; ++x) {
+        char * q = (char *) ggml_cuda_heph_q8_1(*cuda_ctx, units[x].mul, false);
+        if (q == nullptr) {
+            return 0;
+        }
+        jobs.x[x]    = (const float *) units[x].x->data;
+        jobs.w[x]    = (const float *) units[x].w->data;
+        jobs.dst[x]  = (float *) units[x].mul->data;
+        jobs.q8_1[x] = q;
+        jobs.eps[x]  = units[x].eps;
+    }
+    ggml_cuda_op_rms_norm_mul_q8_jobs(*cuda_ctx, jobs, ggml_nelements(units[0].mul));
+    return units[n - 1].last - i;
 }
 
 // Post-projection stage: a run of row chains followed by their rotations, all in one launch.

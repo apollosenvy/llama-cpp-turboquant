@@ -128,3 +128,34 @@ struct heph_row_jobs {
     int          n;
 };
 void ggml_cuda_op_row_jobs(ggml_backend_cuda_context & ctx, const heph_row_jobs & jobs);
+
+// control() for up to four independent streams at once (the Q, K and V inputs of a looped layer):
+// one launch for all gates, one for all applies. Each job as ggml_cuda_op_loop_control_raw.
+#define HEPH_CTRL_MAX_JOBS 4
+struct heph_ctrl_jobs {
+    const float * cur[HEPH_CTRL_MAX_JOBS];
+    const float * msg[HEPH_CTRL_MAX_JOBS];
+    const float * w_down[HEPH_CTRL_MAX_JOBS];
+    const float * w_forget[HEPH_CTRL_MAX_JOBS];
+    const float * w_gain[HEPH_CTRL_MAX_JOBS];
+    float *       gate[HEPH_CTRL_MAX_JOBS];   // scratch, [rank, n_tokens]
+    float *       dst[HEPH_CTRL_MAX_JOBS];
+    int64_t       cur_stride[HEPH_CTRL_MAX_JOBS];
+    int64_t       msg_stride[HEPH_CTRL_MAX_JOBS];
+    float         eps_cur[HEPH_CTRL_MAX_JOBS];
+    float         eps_msg[HEPH_CTRL_MAX_JOBS];
+    int           n;
+};
+void ggml_cuda_op_loop_control_jobs(ggml_backend_cuda_context & ctx, const heph_ctrl_jobs & jobs, int n_embd, int n_tokens, int rank);
+
+// rms_norm(x)*w with F32 and q8_1 results for up to four vectors of equal length in one launch
+#define HEPH_NORMQ_MAX_JOBS 4
+struct heph_normq_jobs {
+    const float * x[HEPH_NORMQ_MAX_JOBS];
+    const float * w[HEPH_NORMQ_MAX_JOBS];
+    float *       dst[HEPH_NORMQ_MAX_JOBS];
+    void *        q8_1[HEPH_NORMQ_MAX_JOBS];
+    float         eps[HEPH_NORMQ_MAX_JOBS];
+    int           n;
+};
+void ggml_cuda_op_rms_norm_mul_q8_jobs(ggml_backend_cuda_context & ctx, const heph_normq_jobs & jobs, int n);

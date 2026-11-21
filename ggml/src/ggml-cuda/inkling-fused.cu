@@ -291,18 +291,30 @@ void ggml_cuda_op_mix_states(ggml_backend_cuda_context & ctx, const heph_mix_sta
 
 // one block per (gate row, token): gate[g, t] = sum_e w_down[e, g]*a[e, t]*ra + w_down[n + e, g]*b[e, t]*rb
 // with_norm: ra and rb are the rms_norm factors of a and b, recomputed per block; otherwise 1
+// Launches whose total thread count is a multiple of 98,304 (96 compute units x 1024), or up to 1,536 below one, take
+// 6 to 9 us longer on the RX 7900 XTX, up to four multiples (HILLCLIMB.md, "Slow launch grid sizes").
+static bool heph_slow_grid(int64_t threads) {
+    const int64_t r = threads % 98304;
+    return threads <= 4*98304 && (r == 0 || r > 98304 - 1536);
+}
+
 template <bool with_norm>
-static __global__ void loop_control_gate_f32(const float * a, const float * b, const int64_t a_stride, const int64_t b_stride,
-                                             const float * w_down, float * gate, const int n_embd, const int rank,
-                                             const float eps_a, const float eps_b) {
+static __global__ void loop_control_gate_f32(const heph_ctrl_jobs jobs, const int n_embd, const int rank) {
     ggml_cuda_pdl_lc();
     const int g   = blockIdx.x;
     const int t   = blockIdx.y;
+    const int job = blockIdx.z;
     const int tid = threadIdx.x;
+    if (g >= rank) {
+        return; // a block the launch added to step over a slow grid size
+    }
 
-    const float * wr = w_down + (int64_t) g*2*n_embd;
-    const float * at = a + t*a_stride;
-    const float * bt = b + t*b_stride;
+    const float * wr = jobs.w_down[job] + (int64_t) g*2*n_embd;
+    const float * at = jobs.cur[job] + t*jobs.cur_stride[job];
+    const float * bt = jobs.msg[job] + t*jobs.msg_stride[job];
+    float *       gate  = jobs.gate[job];
+    const float   eps_a = jobs.eps_cur[job];
+    const float   eps_b = jobs.eps_msg[job];
 
     ggml_cuda_pdl_sync();
 
@@ -355,9 +367,25 @@ static __global__ void loop_control_gate_f32(const float * a, const float * b, c
 }
 static_assert(HEPH_CTRL_BLOCK / WARP_SIZE == WARP_SIZE, "the second reduction level assumes one warp of partials");
 
-static void heph_launch_control_apply(cudaStream_t stream, const float * gate, const ggml_tensor * w_forget, const ggml_tensor * w_gain,
-                                      const float * cur, const float * msg, int64_t cs, int64_t ms, float * dst,
-                                      int n_embd, int rank, int64_t n);
+static __global__ void loop_control_apply_strided_f32(const heph_ctrl_jobs jobs, const int n_embd, const int rank, const int64_t n);
+
+// all gates in one launch, then all applies in one launch
+template <bool with_norm>
+static void heph_launch_control(cudaStream_t stream, const heph_ctrl_jobs & jobs, int n_embd, int n_tokens, int rank) {
+    {
+        const int grid_x = heph_slow_grid((int64_t) rank*n_tokens*jobs.n*HEPH_CTRL_BLOCK) ? rank + 1 : rank;
+        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(grid_x, n_tokens, jobs.n), dim3(HEPH_CTRL_BLOCK, 1, 1), 0, stream);
+        ggml_cuda_kernel_launch(loop_control_gate_f32<with_norm>, lp, jobs, n_embd, rank);
+    }
+    {
+        constexpr int n_waves = 256 / WARP_SIZE; // HEPH_CTRL_APPLY_BLOCK
+        const int64_t n      = (int64_t) n_embd*n_tokens;
+        // one element per wave for decode, bounded grid for long batches
+        const int64_t blocks = std::min<int64_t>((n*jobs.n + n_waves - 1) / n_waves, 16384);
+        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(blocks, 1, 1), dim3(256, 1, 1), 0, stream);
+        ggml_cuda_kernel_launch(loop_control_apply_strided_f32, lp, jobs, n_embd, rank, n);
+    }
+}
 
 void ggml_cuda_op_loop_control(ggml_backend_cuda_context & ctx, const ggml_tensor * a, const ggml_tensor * b,
                                const ggml_tensor * w_down, const ggml_tensor * w_forget, const ggml_tensor * w_gain,
@@ -368,14 +396,28 @@ void ggml_cuda_op_loop_control(ggml_backend_cuda_context & ctx, const ggml_tenso
     const int64_t n      = (int64_t) n_embd*nt;
     cudaStream_t  stream = ctx.stream();
 
+    // a and b are the normalised inputs of the gate; the apply reads cur and msg
+    heph_ctrl_jobs gate_jobs = {};
+    gate_jobs.n = 1;
+    gate_jobs.cur[0] = (const float *) a->data;   gate_jobs.cur_stride[0] = n_embd;
+    gate_jobs.msg[0] = (const float *) b->data;   gate_jobs.msg_stride[0] = n_embd;
+    gate_jobs.w_down[0] = (const float *) w_down->data;
+    gate_jobs.gate[0]   = (float *) gate_tmp->data;
     {
         const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(rank, nt, 1), dim3(HEPH_CTRL_BLOCK, 1, 1), 0, stream);
-        ggml_cuda_kernel_launch(loop_control_gate_f32<false>, lp, (const float *) a->data, (const float *) b->data, (int64_t) n_embd, (int64_t) n_embd,
-            (const float *) w_down->data, (float *) gate_tmp->data, n_embd, rank, 0.0f, 0.0f);
+        ggml_cuda_kernel_launch(loop_control_gate_f32<false>, lp, gate_jobs, n_embd, rank);
     }
+    heph_ctrl_jobs jobs = gate_jobs;
+    jobs.cur[0] = (const float *) cur->data;
+    jobs.msg[0] = (const float *) msg->data;
+    jobs.w_forget[0] = (const float *) w_forget->data;
+    jobs.w_gain[0]   = (const float *) w_gain->data;
+    jobs.dst[0]      = (float *) dst->data;
     {
-        heph_launch_control_apply(stream, (const float *) gate_tmp->data, w_forget, w_gain, (const float *) cur->data,
-            (const float *) msg->data, n_embd, n_embd, (float *) dst->data, n_embd, rank, n);
+        constexpr int n_waves = 256 / WARP_SIZE;
+        const int64_t blocks = std::min<int64_t>((n + n_waves - 1) / n_waves, 16384);
+        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(blocks, 1, 1), dim3(256, 1, 1), 0, stream);
+        ggml_cuda_kernel_launch(loop_control_apply_strided_f32, lp, jobs, n_embd, rank, n);
     }
 }
 
@@ -445,9 +487,7 @@ void ggml_cuda_op_conv_res_scale(ggml_backend_cuda_context & ctx, const ggml_ten
 // One wave per output element: the lanes share the rank-wide dot products, so no thread loops over memory.
 // cur and msg are [n_embd, n_tokens] with a column stride.
 #define HEPH_CTRL_APPLY_BLOCK 256
-static __global__ void loop_control_apply_strided_f32(const float * gate, const float * w_forget, const float * w_gain,
-                                                      const float * cur, const float * msg, const int64_t cur_stride, const int64_t msg_stride,
-                                                      float * dst, const int n_embd, const int rank, const int64_t n) {
+static __global__ void loop_control_apply_strided_f32(const heph_ctrl_jobs jobs, const int n_embd, const int rank, const int64_t n) {
     ggml_cuda_pdl_lc();
     constexpr int n_waves = HEPH_CTRL_APPLY_BLOCK / WARP_SIZE;
     const int     lane   = threadIdx.x % WARP_SIZE;
@@ -456,13 +496,21 @@ static __global__ void loop_control_apply_strided_f32(const float * gate, const 
 
     ggml_cuda_pdl_sync();
 
-    for (int64_t idx = first; idx < n; idx += stride) {
+    // n elements per job, the jobs back to back
+    for (int64_t gidx = first; gidx < n*jobs.n; gidx += stride) {
+        const int     job = gidx / n;
+        const int64_t idx = gidx - job*n;
         const int     e = idx % n_embd;
         const int64_t t = idx / n_embd;
 
-        const float * gt = gate + t*rank;
-        const float * wf = w_forget + (int64_t) e*rank;
-        const float * wg = w_gain   + (int64_t) e*rank;
+        const float * gt = jobs.gate[job] + t*rank;
+        const float * wf = jobs.w_forget[job] + (int64_t) e*rank;
+        const float * wg = jobs.w_gain[job]   + (int64_t) e*rank;
+        const float * cur = jobs.cur[job];
+        const float * msg = jobs.msg[job];
+        float *       dst = jobs.dst[job];
+        const int64_t cur_stride = jobs.cur_stride[job];
+        const int64_t msg_stride = jobs.msg_stride[job];
 
         float f = 0.0f;
         float g = 0.0f;
@@ -479,15 +527,9 @@ static __global__ void loop_control_apply_strided_f32(const float * gate, const 
     }
 }
 
-static void heph_launch_control_apply(cudaStream_t stream, const float * gate, const ggml_tensor * w_forget, const ggml_tensor * w_gain,
-                                      const float * cur, const float * msg, int64_t cs, int64_t ms, float * dst,
-                                      int n_embd, int rank, int64_t n) {
-    constexpr int n_waves = HEPH_CTRL_APPLY_BLOCK / WARP_SIZE;
-    // one element per wave for decode, bounded grid for long batches
-    const int64_t blocks = std::min<int64_t>((n + n_waves - 1) / n_waves, 16384);
-    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(blocks, 1, 1), dim3(HEPH_CTRL_APPLY_BLOCK, 1, 1), 0, stream);
-    ggml_cuda_kernel_launch(loop_control_apply_strided_f32, lp, gate, (const float *) w_forget->data, (const float *) w_gain->data,
-        cur, msg, cs, ms, dst, n_embd, rank, n);
+void ggml_cuda_op_loop_control_jobs(ggml_backend_cuda_context & ctx, const heph_ctrl_jobs & jobs, int n_embd, int n_tokens, int rank) {
+    GGML_ASSERT(jobs.n >= 1 && jobs.n <= HEPH_CTRL_MAX_JOBS && n_embd <= HEPH_CTRL_J*HEPH_CTRL_BLOCK);
+    heph_launch_control<true>(ctx.stream(), jobs, n_embd, n_tokens, rank);
 }
 
 void ggml_cuda_op_loop_control_raw(ggml_backend_cuda_context & ctx, const ggml_tensor * cur, const ggml_tensor * msg,
@@ -502,15 +544,17 @@ void ggml_cuda_op_loop_control_raw(ggml_backend_cuda_context & ctx, const ggml_t
     const int64_t ms     = msg->nb[1] / sizeof(float);
     cudaStream_t  stream = ctx.stream();
 
-    {
-        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(rank, nt, 1), dim3(HEPH_CTRL_BLOCK, 1, 1), 0, stream);
-        ggml_cuda_kernel_launch(loop_control_gate_f32<true>, lp, (const float *) cur->data, (const float *) msg->data, cs, ms,
-            (const float *) w_down->data, (float *) gate_tmp->data, n_embd, rank, eps_cur, eps_msg);
-    }
-    {
-        heph_launch_control_apply(stream, (const float *) gate_tmp->data, w_forget, w_gain, (const float *) cur->data,
-            (const float *) msg->data, cs, ms, (float *) dst->data, n_embd, rank, n);
-    }
+    heph_ctrl_jobs jobs = {};
+    jobs.n = 1;
+    jobs.cur[0] = (const float *) cur->data;   jobs.cur_stride[0] = cs;   jobs.eps_cur[0] = eps_cur;
+    jobs.msg[0] = (const float *) msg->data;   jobs.msg_stride[0] = ms;   jobs.eps_msg[0] = eps_msg;
+    jobs.w_down[0]   = (const float *) w_down->data;
+    jobs.w_forget[0] = (const float *) w_forget->data;
+    jobs.w_gain[0]   = (const float *) w_gain->data;
+    jobs.gate[0]     = (float *) gate_tmp->data;
+    jobs.dst[0]      = (float *) dst->data;
+    GGML_UNUSED(n);
+    heph_launch_control<true>(stream, jobs, n_embd, nt, rank);
 }
 
 static __global__ void moe_weights_norm_f32(const float * w, float * dst, const int n_used, const int64_t n_tokens,
@@ -774,11 +818,17 @@ void ggml_cuda_op_rot_rows(ggml_backend_cuda_context & ctx, const heph_rot_args 
 // form (as quantize_q8_1 would, zero blocks up to n_pad), so the matvecs that read it need no quantize launch.
 #define HEPH_NORMQ_BLOCK 1024
 #define HEPH_NORMQ_J 3
-static __global__ void rms_norm_mul_q8_f32(const float * x, const float * w, float * dst, block_q8_1 * q,
-                                           const int n, const int n_pad, const float eps) {
+static __global__ void rms_norm_mul_q8_f32(const heph_normq_jobs jobs, const int n, const int n_pad) {
     ggml_cuda_pdl_lc();
     const int tid  = threadIdx.x;
     const int lane = tid % WARP_SIZE;
+    const int job  = blockIdx.x;
+
+    const float * x   = jobs.x[job];
+    const float * w   = jobs.w[job];
+    float *       dst = jobs.dst[job];
+    block_q8_1 *  q   = (block_q8_1 *) jobs.q8_1[job];
+    const float   eps = jobs.eps[job];
 
     __shared__ float s_part[HEPH_NORMQ_BLOCK / WARP_SIZE];
     __shared__ float s_total;
@@ -834,14 +884,23 @@ static __global__ void rms_norm_mul_q8_f32(const float * x, const float * w, flo
 }
 static_assert(HEPH_NORMQ_BLOCK / WARP_SIZE == WARP_SIZE && WARP_SIZE == QK8_1, "one warp per q8_1 block, one warp of partial sums");
 
+void ggml_cuda_op_rms_norm_mul_q8_jobs(ggml_backend_cuda_context & ctx, const heph_normq_jobs & jobs, int n) {
+    const int n_pad = GGML_PAD(n, MATRIX_ROW_PADDING);
+    GGML_ASSERT(jobs.n >= 1 && jobs.n <= HEPH_NORMQ_MAX_JOBS && n <= HEPH_NORMQ_J*HEPH_NORMQ_BLOCK && n_pad <= HEPH_NORMQ_J*HEPH_NORMQ_BLOCK);
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(jobs.n, 1, 1), dim3(HEPH_NORMQ_BLOCK, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(rms_norm_mul_q8_f32, lp, jobs, n, n_pad);
+}
+
 void ggml_cuda_op_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w, ggml_tensor * dst,
                                   void * q8_1, float eps) {
-    const int n     = ggml_nelements(dst);
-    const int n_pad = GGML_PAD(n, MATRIX_ROW_PADDING);
-    GGML_ASSERT(n <= HEPH_NORMQ_J*HEPH_NORMQ_BLOCK && n_pad <= HEPH_NORMQ_J*HEPH_NORMQ_BLOCK);
-    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(1, 1, 1), dim3(HEPH_NORMQ_BLOCK, 1, 1), 0, ctx.stream());
-    ggml_cuda_kernel_launch(rms_norm_mul_q8_f32, lp, (const float *) x->data, (const float *) w->data, (float *) dst->data,
-        (block_q8_1 *) q8_1, n, n_pad, eps);
+    heph_normq_jobs jobs = {};
+    jobs.n       = 1;
+    jobs.x[0]    = (const float *) x->data;
+    jobs.w[0]    = (const float *) w->data;
+    jobs.dst[0]  = (float *) dst->data;
+    jobs.q8_1[0] = q8_1;
+    jobs.eps[0]  = eps;
+    ggml_cuda_op_rms_norm_mul_q8_jobs(ctx, jobs, ggml_nelements(dst));
 }
 
 static __global__ void row_jobs_f32(const heph_row_jobs jobs) {

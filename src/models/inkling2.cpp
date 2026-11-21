@@ -322,7 +322,13 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         for (int j = 0; j < 3; ++j) {
             inputs[j] = control(inputs[j], message(LOOP_CTRL_Q + j), *loop, LOOP_CTRL_Q + j);
         }
+        // the three controls as one run of nodes, ahead of the norms: a backend can evaluate them together. Node order only.
+        for (int j = 0; j < 3; ++j) {
+            ggml_build_forward_expand(gf, inputs[j]);
+        }
     }
+    // kept allocated until the norms are done, so the norm of one input cannot be placed on another input
+    ggml_tensor * unnormed[3] = { inputs[0], inputs[1], inputs[2] };
 
     if (is_swa && messages) {
         for (int j = 0; j < 3; ++j) {
@@ -349,7 +355,13 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         ggml_tensor * gate  = build_lora_mm(layer.wqkv_gate, inputs[0]);
         ggml_tensor * Kdyn  = is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]);
         ggml_tensor * Vdyn  = is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]);
-        for (ggml_tensor * t : { inputs[0], inputs[1], inputs[2], Kraw, Vraw, Qraw, Rraw, sinks, gate, Kdyn, Vdyn }) {
+        for (ggml_tensor * t : { inputs[0], inputs[1], inputs[2] }) {
+            ggml_build_forward_expand(gf, t);
+        }
+        for (ggml_tensor * t : unnormed) {
+            ggml_build_forward_expand(gf, ggml_reshape_1d(ctx0, t, ggml_nelements(t)));
+        }
+        for (ggml_tensor * t : { Kraw, Vraw, Qraw, Rraw, sinks, gate, Kdyn, Vdyn }) {
             if (t) {
                 ggml_build_forward_expand(gf, t);
             }
