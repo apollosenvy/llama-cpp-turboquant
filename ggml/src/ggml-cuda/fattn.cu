@@ -526,6 +526,11 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(Q8_0, F8_E4M3)
     FATTN_VEC_CASES_ALL_D(BF16, F8_E4M3)
     FATTN_VEC_CASES_ALL_D(F8_E4M3, F8_E4M3)
+#ifdef GGML_USE_HIP
+    if (head_size == QK_TURBO3 && type_K == GGML_TYPE_TURBO3_0 && type_V == GGML_TYPE_TURBO3_0) {
+        return ggml_cuda_flash_attn_ext_vec_case<QK_TURBO3, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>;
+    }
+#endif
 
     return nullptr;
 }
@@ -569,6 +574,7 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_F8_E4M3:
             return true;
         default:

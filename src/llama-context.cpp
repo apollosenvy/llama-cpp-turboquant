@@ -4484,6 +4484,16 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    const bool turbo3_cache = params.type_k == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO3_0;
+    if (turbo3_cache) {
+        const char * rot_disable = getenv("LLAMA_ATTN_ROT_DISABLE");
+        if (model->arch != LLM_ARCH_INKLING2_LOOP || params.type_k != params.type_v ||
+                !model->attn_rot || (rot_disable && atoi(rot_disable) != 0)) {
+            LLAMA_LOG_ERROR("%s: turbo3 requires Inkling 2 Mini, turbo3 for both K and V, and attention rotation enabled\n", __func__);
+            return nullptr;
+        }
+    }
+
     const bool fp8_cache = params.type_k == GGML_TYPE_F8_E4M3 || params.type_v == GGML_TYPE_F8_E4M3;
     // Direct cache consumers do not use the shared attention scaling helpers.
     if (fp8_cache && (model->hparams.is_mla() ||

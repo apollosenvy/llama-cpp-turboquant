@@ -3792,20 +3792,21 @@ static ggml_tensor * build_attn_iswa_impl(
     auto * k_rot = is_swa ? inp->self_k_rot_swa[il] : inp->self_k_rot[il];
     auto * v_rot = is_swa ? inp->self_v_rot_swa[il] : inp->self_v_rot[il];
 
+    const auto * mctx_iswa = inp->mctx;
+    const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
+    const bool turbo3 = mctx_cur->type_k() == GGML_TYPE_TURBO3_0;
+
     if (k_rot) {
-        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
+        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot, turbo3);
         if (k_cur) {
-            k_cur = llama_mul_mat_hadamard(ctx0, k_cur, k_rot);
+            k_cur = llama_mul_mat_hadamard(ctx0, k_cur, k_rot, turbo3);
         }
     }
     if (v_rot) {
         if (v_cur) {
-            v_cur = llama_mul_mat_hadamard(ctx0, v_cur, v_rot);
+            v_cur = llama_mul_mat_hadamard(ctx0, v_cur, v_rot, turbo3);
         }
     }
-
-    const auto * mctx_iswa = inp->mctx;
-    const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
 
     build_attn_scale_kv_inputs(ctx0, mctx_cur, q_cur, k_cur, v_cur, il);
 
@@ -3851,7 +3852,7 @@ static ggml_tensor * build_attn_iswa_impl(
     gctx.cb(cur, "kqv_out", il);
 
     if (v_rot) {
-        cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
+        cur = llama_mul_mat_hadamard(ctx0, cur, v_rot, turbo3);
     }
 
     if (wo) {

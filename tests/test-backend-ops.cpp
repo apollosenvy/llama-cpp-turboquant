@@ -112,6 +112,10 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
 
     if (tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_I32) {
         ggml_backend_tensor_set(tensor, data.data(), 0, nels * sizeof(float));
+    } else if (tensor->type == GGML_TYPE_TURBO3_0) {
+        std::vector<uint8_t> blocks(ggml_row_size(tensor->type, nels));
+        ggml_get_type_traits(tensor->type)->from_float_ref(data.data(), blocks.data(), nels);
+        ggml_backend_tensor_set(tensor, blocks.data(), 0, blocks.size());
     } else if (ggml_is_quantized(tensor->type) || tensor->type == GGML_TYPE_F8_E4M3 || tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_BF16) {
         GGML_ASSERT(nels % ggml_blck_size(tensor->type) == 0);
 
@@ -10939,6 +10943,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_I32, { 256, 5, 1, 3 }, { 1, 1, }, 1, false));
+    // Inkling Mini writes eight 128-wide K or V blocks per token.
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_TURBO3_0, GGML_TYPE_I64, {1024, 64, 1, 1}, {1, 1}, 16));
+
     for (ggml_type src_type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (ggml_type type : all_types) {
             for (int b : {1, 7}) {
@@ -13365,6 +13372,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // more V-is-sub-view-of-K cases: other head shapes, and full views with equal head sizes
     test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 4, {8, 1},  512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
+    // Inkling Mini has three Q heads per KV head and a distinct bias for each Q head.
+    for (const auto & [kv, nq] : std::vector<std::pair<int, int>>{{1024, 1}, {2048, 2}, {4096, 16}, {65536, 1}, {262144, 1}, {524288, 1}}) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, nq, true, true, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, {0, 2, 1, 3}, false, false, 0, 0, 24));
+    }
+
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1},  512, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(64,  64,  4, {1, 1},  512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
 
@@ -13767,6 +13780,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    for (auto type : {GGML_TYPE_F16, GGML_TYPE_TURBO3_0}) {
+        for (int kv : {1024, 65536, 262144, 524288}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, 1, true, true, 0, 0,
+                    GGML_PREC_F32, type, type, {0, 2, 1, 3}, false, false, 0, 0, 24));
+        }
+    }
 
     test_cases.emplace_back(new test_timestep_embedding());
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {32769, 1, 1, 1}, 4096, 10000));

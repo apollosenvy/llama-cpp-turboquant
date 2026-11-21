@@ -2,6 +2,7 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#include "smithy-config.h"
 
 #include <cstdint>
 #include <type_traits>
@@ -630,6 +631,14 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+    // kernel-anvil (smithy): small_k runs nwarps rows per block, the rule
+    // upstream already applies to its GENERIC/GCN/TURING/GB10 tables. Upstream
+    // never enables small_k on RDNA, so on AMD this is reached only when a
+    // profiled smithy config re-enabled it for a shape measured faster with it.
+    // Host and device share this constexpr, so launch params and kernel agree.
+    if (small_k && ncols_dst == 1) {
+        return nwarps;
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10 || table_id == MMVQ_PARAMETERS_RDNA1) {
         switch (ncols_dst) {
             case 1:
@@ -1243,6 +1252,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 (is_nvidia_pascal_older && std::find(slow_pascal.begin(), slow_pascal.end(), type) != slow_pascal.end()) ||
                 GGML_CUDA_CC_IS_RDNA(cc)) {
             use = false;
+        }
+
+        // kernel-anvil (smithy) per-shape override: a profiled config can
+        // re-enable small_k where the blanket rules above (notably the RDNA
+        // disable) leave measured speedup on the table for this GPU, model and
+        // (type, nrows, ncols). Absent config = no-op. Forces the path on, never off.
+        if (!use && c_ncols_dst == 1) {
+            const smithy_shape_config scfg = smithy_lookup(type, nrows_x, ncols_x);
+            if (scfg.rows_per_block > 1) {
+                use = true;
+            }
         }
 
         return use;

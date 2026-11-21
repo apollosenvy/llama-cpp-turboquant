@@ -177,6 +177,14 @@ typedef sycl::half2 ggml_half2;
 #define GGML_EXTENSION __extension__
 #endif // _MSC_VER
 
+#define QK_TURBO3 128
+typedef struct {
+    ggml_half norm;
+    uint8_t qs[QK_TURBO3/4];
+    uint8_t signs[QK_TURBO3/8];
+} block_turbo3_0;
+static_assert(sizeof(block_turbo3_0) == 50, "wrong turbo3 block size");
+
 #define QK1_0 128
 typedef struct {
     ggml_half d;           // delta

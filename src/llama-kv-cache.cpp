@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <random>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -20,7 +21,7 @@ static bool ggml_is_power_of_2(int n) {
 
 // orthonormal Walsh-Hadamard rotation matrix
 // note: res^2 == I
-static void ggml_gen_hadamard(ggml_tensor * tensor) {
+static void ggml_gen_hadamard(ggml_tensor * tensor, bool signed_rotation = false) {
     assert(tensor->type == GGML_TYPE_F32);
 
     const int n = tensor->ne[0];
@@ -49,6 +50,19 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
                 data[(i + s)*n + (j    )] =  val;
                 data[(i    )*n + (j + s)] =  val;
                 data[(i + s)*n + (j + s)] = -val;
+            }
+        }
+    }
+
+    if (signed_rotation) {
+        std::mt19937 generator(42);
+        std::vector<float> signs(n);
+        for (float & sign : signs) {
+            sign = (generator() & 1) ? 1.0f : -1.0f;
+        }
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < n; ++j) {
+                data[i*n + j] *= signs[i]*signs[j];
             }
         }
     }
@@ -335,7 +349,7 @@ llama_kv_cache::llama_kv_cache(
             }
         }
         if (attn_rot_v) {
-            n_rot_v = 64;
+            n_rot_v = type_v == GGML_TYPE_TURBO3_0 ? ggml_blck_size(type_v) : 64;
             // using smaller rotation matrices for V seems beneficial
             // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4146397570
             //while (hparams.n_embd_head_v() % (2*n_rot_v) == 0) {
@@ -363,7 +377,7 @@ llama_kv_cache::llama_kv_cache(
             ggml_tensor * tmp = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n, n);
             tmp->data = attn_rot_hadamard[n].data();
 
-            ggml_gen_hadamard(tmp);
+            ggml_gen_hadamard(tmp, type_k == GGML_TYPE_TURBO3_0 && type_v == GGML_TYPE_TURBO3_0);
         }
     }
 

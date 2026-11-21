@@ -17,6 +17,29 @@
 #include <omp.h>
 #endif
 
+#define GGML_TURBO3_TABLE static const
+#define GGML_TURBO3_FN static inline
+#include "ggml-turbo3.h"
+#undef GGML_TURBO3_FN
+#undef GGML_TURBO3_TABLE
+
+void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * GGML_RESTRICT y, int64_t k) {
+    GGML_ASSERT(k % QK_TURBO3 == 0);
+    for (int64_t i = 0; i < k/QK_TURBO3; ++i) {
+        y[i].norm = GGML_FP32_TO_FP16(ggml_turbo3_pack(x + i*QK_TURBO3, y + i));
+    }
+}
+
+void dequantize_row_turbo3_0(const block_turbo3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    GGML_ASSERT(k % QK_TURBO3 == 0);
+    for (int64_t i = 0; i < k/QK_TURBO3; ++i) {
+        const float norm = GGML_FP16_TO_FP32(x[i].norm);
+        for (int j = 0; j < QK_TURBO3; ++j) {
+            y[i*QK_TURBO3 + j] = norm*ggml_turbo3_value(x + i, j);
+        }
+    }
+}
+
 #define GROUP_MAX_EPS 1e-15f
 #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
 #define GROUP_MAX_EPS_IQ2_S 1e-8f

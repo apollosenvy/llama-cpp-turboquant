@@ -63,6 +63,27 @@ void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
     quantize_row_nvfp4_ref(x, y, k);
 }
 
+void quantize_row_turbo3_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_turbo3_0_ref(x, y, k);
+}
+
+void ggml_vec_dot_turbo3_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1 && n % QK_TURBO3 == 0);
+    GGML_UNUSED_VARS(bs, bx, by);
+
+    const block_turbo3_0 * x = vx;
+    const float * y = vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n/QK_TURBO3; ++i) {
+        float block[QK_TURBO3];
+        dequantize_row_turbo3_0(x + i, block, QK_TURBO3);
+        for (int j = 0; j < QK_TURBO3; ++j) {
+            sum += block[j]*y[i*QK_TURBO3 + j];
+        }
+    }
+    *s = sum;
+}
+
 void quantize_row_f8_e4m3(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_f8_e4m3_ref(x, y, k);
 }
