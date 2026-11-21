@@ -285,41 +285,74 @@ void ggml_cuda_op_mix_states(ggml_backend_cuda_context & ctx, const heph_mix_sta
     ggml_cuda_kernel_launch(mix_states_f32, lp, states, n_states, (const float *) query->data, (float *) dst->data, n_embd, nq, eps, sm_scale);
 }
 
-#define HEPH_CTRL_BLOCK 256
+#define HEPH_CTRL_BLOCK 1024
+#define HEPH_CTRL_J 3 // elements per thread, loaded at once: n_embd <= HEPH_CTRL_J*HEPH_CTRL_BLOCK
 
-// one block per (gate row, token): gate[g, t] = sum_e w_down[e, g] * [a; b][e, t]
-static __global__ void loop_control_gate_f32(const float * a, const float * b, const float * w_down, float * gate,
-                                             const int n_embd, const int rank) {
+// one block per (gate row, token): gate[g, t] = sum_e w_down[e, g]*a[e, t]*ra + w_down[n + e, g]*b[e, t]*rb
+// with_norm: ra and rb are the rms_norm factors of a and b, recomputed per block; otherwise 1
+template <bool with_norm>
+static __global__ void loop_control_gate_f32(const float * a, const float * b, const int64_t a_stride, const int64_t b_stride,
+                                             const float * w_down, float * gate, const int n_embd, const int rank,
+                                             const float eps_a, const float eps_b) {
     ggml_cuda_pdl_lc();
     const int g   = blockIdx.x;
     const int t   = blockIdx.y;
     const int tid = threadIdx.x;
 
     const float * wr = w_down + (int64_t) g*2*n_embd;
-    const float * at = a + (int64_t) t*n_embd;
-    const float * bt = b + (int64_t) t*n_embd;
+    const float * at = a + t*a_stride;
+    const float * bt = b + t*b_stride;
 
     ggml_cuda_pdl_sync();
 
-    float sum = 0.0f;
-    for (int e = tid; e < n_embd; e += HEPH_CTRL_BLOCK) {
-        sum += wr[e]*at[e] + wr[n_embd + e]*bt[e];
+    float av[HEPH_CTRL_J], bv[HEPH_CTRL_J], wa[HEPH_CTRL_J], wb[HEPH_CTRL_J];
+#pragma unroll
+    for (int j = 0; j < HEPH_CTRL_J; ++j) {
+        const int  e  = tid + j*HEPH_CTRL_BLOCK;
+        const bool in = e < n_embd;
+        av[j] = in ? at[e] : 0.0f;
+        bv[j] = in ? bt[e] : 0.0f;
+        wa[j] = in ? wr[e] : 0.0f;
+        wb[j] = in ? wr[n_embd + e] : 0.0f;
     }
-    sum = warp_reduce_sum(sum);
+    float v[4] = { 0.0f, 0.0f, 0.0f, 0.0f }; // dot_a, dot_b, ss_a, ss_b
+#pragma unroll
+    for (int j = 0; j < HEPH_CTRL_J; ++j) {
+        v[0] += wa[j]*av[j];
+        v[1] += wb[j]*bv[j];
+        v[2] += av[j]*av[j];
+        v[3] += bv[j]*bv[j];
+    }
 
-    __shared__ float s_sum[HEPH_CTRL_BLOCK / WARP_SIZE];
-    if (tid % WARP_SIZE == 0) {
-        s_sum[tid / WARP_SIZE] = sum;
+    constexpr int n_red = with_norm ? 4 : 2;
+    __shared__ float s_v[n_red][HEPH_CTRL_BLOCK / WARP_SIZE];
+#pragma unroll
+    for (int k = 0; k < n_red; ++k) {
+        v[k] = warp_reduce_sum(v[k]);
+        if (tid % WARP_SIZE == 0) {
+            s_v[k][tid / WARP_SIZE] = v[k];
+        }
     }
     __syncthreads();
-    if (tid == 0) {
-        float total = 0.0f;
-        for (int k = 0; k < HEPH_CTRL_BLOCK / WARP_SIZE; ++k) {
-            total += s_sum[k];
+    // second level: the first warp reduces the per-warp partials (HEPH_CTRL_BLOCK / WARP_SIZE == WARP_SIZE)
+    if (tid < WARP_SIZE) {
+        float tot[n_red];
+#pragma unroll
+        for (int k = 0; k < n_red; ++k) {
+            tot[k] = warp_reduce_sum(s_v[k][tid]);
         }
-        gate[(int64_t) t*rank + g] = total;
+        if (tid == 0) {
+            if constexpr (with_norm) {
+                const float ra = 1.0f / sqrtf(tot[2] / n_embd + eps_a);
+                const float rb = 1.0f / sqrtf(tot[3] / n_embd + eps_b);
+                gate[(int64_t) t*rank + g] = tot[0]*ra + tot[1]*rb;
+            } else {
+                gate[(int64_t) t*rank + g] = tot[0] + tot[1];
+            }
+        }
     }
 }
+static_assert(HEPH_CTRL_BLOCK / WARP_SIZE == WARP_SIZE, "the second reduction level assumes one warp of partials");
 
 static void heph_launch_control_apply(cudaStream_t stream, const float * gate, const ggml_tensor * w_forget, const ggml_tensor * w_gain,
                                       const float * cur, const float * msg, int64_t cs, int64_t ms, float * dst,
@@ -336,8 +369,8 @@ void ggml_cuda_op_loop_control(ggml_backend_cuda_context & ctx, const ggml_tenso
 
     {
         const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(rank, nt, 1), dim3(HEPH_CTRL_BLOCK, 1, 1), 0, stream);
-        ggml_cuda_kernel_launch(loop_control_gate_f32, lp, (const float *) a->data, (const float *) b->data,
-            (const float *) w_down->data, (float *) gate_tmp->data, n_embd, rank);
+        ggml_cuda_kernel_launch(loop_control_gate_f32<false>, lp, (const float *) a->data, (const float *) b->data, (int64_t) n_embd, (int64_t) n_embd,
+            (const float *) w_down->data, (float *) gate_tmp->data, n_embd, rank, 0.0f, 0.0f);
     }
     {
         heph_launch_control_apply(stream, (const float *) gate_tmp->data, w_forget, w_gain, (const float *) cur->data,
@@ -408,52 +441,6 @@ void ggml_cuda_op_conv_res_scale(ggml_backend_cuda_context & ctx, const ggml_ten
         (float *) dst->data, n_ch, n_conv, x_len, n, scale);
 }
 
-// gate[g, t] = sum_e w_down[e, g]*rms(cur)[e, t] + w_down[n + e, g]*rms(msg)[e, t], norms recomputed per block
-static __global__ void loop_control_gate_raw_f32(const float * cur, const float * msg, const int64_t cur_stride, const int64_t msg_stride,
-                                                 const float * w_down, float * gate, const int n_embd, const int rank,
-                                                 const float eps_cur, const float eps_msg) {
-    ggml_cuda_pdl_lc();
-    const int g   = blockIdx.x;
-    const int t   = blockIdx.y;
-    const int tid = threadIdx.x;
-
-    const float * wr = w_down + (int64_t) g*2*n_embd;
-    const float * at = cur + t*cur_stride;
-    const float * bt = msg + t*msg_stride;
-
-    ggml_cuda_pdl_sync();
-
-    float v[4] = { 0.0f, 0.0f, 0.0f, 0.0f }; // ss_a, ss_b, dot_a, dot_b
-    for (int e = tid; e < n_embd; e += HEPH_CTRL_BLOCK) {
-        const float a = at[e];
-        const float b = bt[e];
-        v[0] += a*a;
-        v[1] += b*b;
-        v[2] += wr[e]*a;
-        v[3] += wr[n_embd + e]*b;
-    }
-
-    __shared__ float s_v[4][HEPH_CTRL_BLOCK / WARP_SIZE];
-    for (int k = 0; k < 4; ++k) {
-        v[k] = warp_reduce_sum(v[k]);
-        if (tid % WARP_SIZE == 0) {
-            s_v[k][tid / WARP_SIZE] = v[k];
-        }
-    }
-    __syncthreads();
-    if (tid == 0) {
-        float tot[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-        for (int k = 0; k < 4; ++k) {
-            for (int w = 0; w < HEPH_CTRL_BLOCK / WARP_SIZE; ++w) {
-                tot[k] += s_v[k][w];
-            }
-        }
-        const float ra = 1.0f / sqrtf(tot[0] / n_embd + eps_cur);
-        const float rb = 1.0f / sqrtf(tot[1] / n_embd + eps_msg);
-        gate[(int64_t) t*rank + g] = tot[2]*ra + tot[3]*rb;
-    }
-}
-
 // One wave per output element: the lanes share the rank-wide dot products, so no thread loops over memory.
 // cur and msg are [n_embd, n_tokens] with a column stride.
 #define HEPH_CTRL_APPLY_BLOCK 256
@@ -516,7 +503,7 @@ void ggml_cuda_op_loop_control_raw(ggml_backend_cuda_context & ctx, const ggml_t
 
     {
         const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(rank, nt, 1), dim3(HEPH_CTRL_BLOCK, 1, 1), 0, stream);
-        ggml_cuda_kernel_launch(loop_control_gate_raw_f32, lp, (const float *) cur->data, (const float *) msg->data, cs, ms,
+        ggml_cuda_kernel_launch(loop_control_gate_f32<true>, lp, (const float *) cur->data, (const float *) msg->data, cs, ms,
             (const float *) w_down->data, (float *) gate_tmp->data, n_embd, rank, eps_cur, eps_msg);
     }
     {
@@ -571,8 +558,21 @@ static __global__ void rel_bias_mask_f16(const float * bias, const float * r, co
     if (rp >= 0 && rp < n_extent) {
         const float * b  = bias + (int64_t) rp*n_rel;
         const float * rv = r + (t*(n/(n_kv*n_tokens)) + h)*n_rel;
-        for (int j = 0; j < n_rel; ++j) {
-            v += b[j]*rv[j];
+        if (n_rel == 16) { // every load issued at once
+            float bv[16], rw[16];
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                bv[j] = b[j];
+                rw[j] = rv[j];
+            }
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                v += bv[j]*rw[j];
+            }
+        } else {
+            for (int j = 0; j < n_rel; ++j) {
+                v += b[j]*rv[j];
+            }
         }
     }
     v = v - sinks[t*(n/(n_kv*n_tokens)) + h] + __half2float(mask[t*n_kv + k]);
@@ -674,4 +674,88 @@ void ggml_cuda_op_conv_full(ggml_backend_cuda_context & ctx, const ggml_tensor *
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3((n + 255) / 256, 1, 1), dim3(256, 1, 1), 0, ctx.stream());
     ggml_cuda_kernel_launch(conv_full_f32<4>, lp, (const float *) past->data, (int64_t) (past->nb[1] / sizeof(float)),
         (const float *) cur->data, (const float *) w->data, (float *) dst->data, (float *) state, n_t, n_ch, n, scale);
+}
+
+// Row transform + dense rotation, one block per row of n_rot elements:
+//   v   = conv ? (cur + sum_j x4[t + j, c]*w[j, c])*conv_scale : x * (scale ? scale : 1)
+//   y   = pre == CLIP ? v*clamp(thr/(||v|| + eps), 0, 1) : pre == RMS ? v/sqrt(mean(v^2) + eps) : v
+//   dst = rot^T-style product: dst[i] = sum_k rot[k, i]*y[k]
+template <int n_rot, int n_conv>
+static __global__ void rot_rows_f32(const heph_rot_args a) {
+    ggml_cuda_pdl_lc();
+    const int64_t row = blockIdx.x;
+    const int     tid = threadIdx.x;
+    const int64_t idx = row*n_rot + tid;
+
+    __shared__ float s_y[n_rot];
+    __shared__ float s_sum[n_rot / WARP_SIZE];
+
+    ggml_cuda_pdl_sync();
+
+    float v;
+    if (a.x4) {
+        const int     c = idx % a.n_ch;
+        const int64_t t = idx / a.n_ch;
+        const float * xc = a.x4 + (int64_t) c*a.x_len + t;
+        const float * wc = a.w + (int64_t) c*n_conv;
+        float xv[n_conv];
+        float wv[n_conv];
+#pragma unroll
+        for (int j = 0; j < n_conv; ++j) {
+            xv[j] = xc[j];
+            wv[j] = wc[j];
+        }
+        float sum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < n_conv; ++j) {
+            sum += xv[j]*wv[j];
+        }
+        v = (a.x[idx] + sum)*a.conv_scale;
+    } else {
+        v = a.x[idx];
+        if (a.scale) {
+            v *= a.scale[(row % a.scale_rows)*n_rot + tid];
+        }
+    }
+
+    if (a.pre != HEPH_ROT_PRE_NONE) {
+        float ss = warp_reduce_sum(v*v);
+        if (tid % WARP_SIZE == 0) {
+            s_sum[tid / WARP_SIZE] = ss;
+        }
+        __syncthreads();
+        ss = 0.0f;
+#pragma unroll
+        for (int k = 0; k < n_rot / WARP_SIZE; ++k) {
+            ss += s_sum[k];
+        }
+        if (a.pre == HEPH_ROT_PRE_CLIP) {
+            v *= fminf(fmaxf(a.thr / (sqrtf(ss) + a.eps), 0.0f), 1.0f);
+        } else {
+            v *= 1.0f / sqrtf(ss / n_rot + a.eps);
+        }
+    }
+    s_y[tid] = v;
+    __syncthreads();
+
+    // loads are issued 16 at a time, a dependent load per iteration would cost about 0.1 us each
+    const float * rr = a.rot + (int64_t) tid*n_rot;
+    float acc = 0.0f;
+    for (int k0 = 0; k0 < n_rot; k0 += 16) {
+        float r[16];
+#pragma unroll
+        for (int u = 0; u < 16; ++u) {
+            r[u] = rr[k0 + u];
+        }
+#pragma unroll
+        for (int u = 0; u < 16; ++u) {
+            acc += r[u]*s_y[k0 + u];
+        }
+    }
+    a.dst[idx] = acc;
+}
+
+void ggml_cuda_op_rot_rows(ggml_backend_cuda_context & ctx, const heph_rot_args & a, int64_t n_rows) {
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(n_rows, 1, 1), dim3(128, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(rot_rows_f32<128, 4>, lp, a);
 }

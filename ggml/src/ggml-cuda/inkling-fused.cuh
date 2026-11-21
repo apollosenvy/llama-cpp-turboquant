@@ -53,3 +53,24 @@ void ggml_cuda_op_conv_concat_store(ggml_backend_cuda_context & ctx, const ggml_
 // whole convolve() without dynamic taps (n_conv == 4): state store, convolution, residual and scale in one kernel
 void ggml_cuda_op_conv_full(ggml_backend_cuda_context & ctx, const ggml_tensor * past, const ggml_tensor * cur, const ggml_tensor * w,
                             ggml_tensor * dst, void * state, float scale);
+
+#define HEPH_ROT_PRE_NONE 0
+#define HEPH_ROT_PRE_CLIP 1
+#define HEPH_ROT_PRE_RMS  2
+struct heph_rot_args {
+    const float * x;          // [128, rows] input, or the residual cur of the convolution when x4 is set
+    const float * scale;      // optional per-element scale, scale_rows rows, cycled
+    const float * x4;         // optional convolve() concat buffer [x_len, n_ch]
+    const float * w;          // convolution taps [4, n_ch]
+    const float * rot;        // [128, 128]
+    float *       dst;
+    int           scale_rows;
+    int           n_ch;
+    int           x_len;
+    int           pre;
+    float         conv_scale;
+    float         thr;
+    float         eps;
+};
+// [convolve() tail] -> [clip | rms_norm] -> rotation, rows of 128 elements, 4 convolution taps
+void ggml_cuda_op_rot_rows(ggml_backend_cuda_context & ctx, const heph_rot_args & a, int64_t n_rows);

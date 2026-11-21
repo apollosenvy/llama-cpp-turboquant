@@ -4470,6 +4470,9 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
 extern "C" { GGML_API int ggml_cuda_heph_fuse_count = 0; }
 
+// returned by a fusion that replaced the node itself and nothing after it: the caller skips the node
+#define HEPH_FUSED_SELF (-1)
+
 static bool heph_fuse_enabled(const char * name) {
     // GGML_CUDA_HEPH_FUSE=0 disables all; GGML_CUDA_HEPH_NOFUSE=clip,mix,... disables by name
     static const char * all = getenv("GGML_CUDA_HEPH_FUSE");
@@ -4488,22 +4491,26 @@ static bool heph_overlap(const ggml_tensor * a, const ggml_tensor * b) {
 
 // x' = scale ? x*scale : x;  dst = x' * clamp(thr / (sqrt(sum_rows(x'^2)) + eps), 0, 1)
 // [MUL] SQR SUM_ROWS SQRT SCALE FILL DIV CLAMP MUL
-static int ggml_cuda_try_fuse_clip_rows(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
-    static const bool enabled = heph_fuse_enabled("clip");
-    if (!enabled) {
-        return 0;
-    }
+struct heph_clip {
+    const ggml_tensor * x;
+    const ggml_tensor * scale;
+    ggml_tensor *       out;
+    float               thr;
+    float               eps;
+    int                 last; // node index of out
+};
 
+static bool heph_parse_clip(ggml_cgraph * cgraph, int i, heph_clip & c) {
     ggml_tensor * head = cgraph->nodes[i];
     const bool has_scale = head->op == GGML_OP_MUL;
     if (!has_scale && head->op != GGML_OP_SQR) {
-        return 0;
+        return false;
     }
 
     const int b     = has_scale ? i + 1 : i;
     const int count = b + 8 - i;
     if (b + 8 > cgraph->n_nodes) {
-        return 0;
+        return false;
     }
 
     static const enum ggml_op chain[9] = { GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE,
@@ -4514,12 +4521,12 @@ static int ggml_cuda_try_fuse_clip_rows(ggml_backend_cuda_context * cuda_ctx, gg
     for (int k = 0; k < count; ++k) {
         idxs[k] = i + k;
         if (cgraph->nodes[i + k]->op != ops[k]) {
-            return 0;
+            return false;
         }
     }
     const int out = b + 7;
     if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, &out, 1)) {
-        return 0;
+        return false;
     }
 
     ggml_tensor * sqr   = cgraph->nodes[b];
@@ -4538,34 +4545,47 @@ static int ggml_cuda_try_fuse_clip_rows(ggml_backend_cuda_context * cuda_ctx, gg
     if ((has_scale && xs != head) || sum->src[0] != sqr || sqrt_->src[0] != sum || sc->src[0] != sqrt_ || fill->src[0] != sc ||
         div->src[0] != fill || div->src[1] != sc || clamp->src[0] != div ||
         !((mul->src[0] == xs && mul->src[1] == clamp) || (mul->src[1] == xs && mul->src[0] == clamp))) {
-        return 0;
+        return false;
     }
 
     if (x->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_is_contiguous(mul) ||
         !ggml_are_same_shape(x, mul) || x->ne[3] != 1 || sum->ne[0] != 1 || sum->ne[1] != x->ne[1] || sum->ne[2] != x->ne[2]) {
-        return 0;
+        return false;
     }
     if (scale) {
         const bool prefix_ok = (scale->ne[1] == x->ne[1] || (scale->ne[1] == 1 && scale->ne[2] == 1)) &&
                                (scale->ne[2] == x->ne[2] || scale->ne[2] == 1) && scale->ne[3] == 1;
         if (scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) || scale->ne[0] != x->ne[0] || !prefix_ok) {
-            return 0;
+            return false;
         }
-        if (heph_overlap(mul, scale)) {
-            return 0;
-        }
+    }
+    if (ggml_get_op_params_f32(sc, 0) != 1.0f || ggml_get_op_params_f32(clamp, 0) != 0.0f || ggml_get_op_params_f32(clamp, 1) != 1.0f) {
+        return false;
+    }
+    c.x     = x;
+    c.scale = scale;
+    c.out   = mul;
+    c.thr   = ggml_get_op_params_f32(fill, 0);
+    c.eps   = ggml_get_op_params_f32(sc, 1);
+    c.last  = b + 7;
+    return true;
+}
+
+static int ggml_cuda_try_fuse_clip_rows(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = heph_fuse_enabled("clip");
+    heph_clip c;
+    if (!enabled || !heph_parse_clip(cgraph, i, c)) {
+        return 0;
+    }
+    if (c.scale && heph_overlap(c.out, c.scale)) {
+        return 0;
     }
     // each thread re-reads x[col] right before writing dst[col], so an exact alias is fine, a shifted one is not
-    if (heph_overlap(mul, x) && mul->data != x->data) {
+    if (heph_overlap(c.out, c.x) && c.out->data != c.x->data) {
         return 0;
     }
-
-    if (ggml_get_op_params_f32(sc, 0) != 1.0f || ggml_get_op_params_f32(clamp, 0) != 0.0f || ggml_get_op_params_f32(clamp, 1) != 1.0f) {
-        return 0;
-    }
-
-    ggml_cuda_op_clip_rows(*cuda_ctx, x, scale, mul, ggml_get_op_params_f32(fill, 0), ggml_get_op_params_f32(sc, 1), 1.0f);
-    return count - 1;
+    ggml_cuda_op_clip_rows(*cuda_ctx, c.x, c.scale, c.out, c.thr, c.eps, 1.0f);
+    return c.last - i;
 }
 
 // true if every node in [first, last) is used only by nodes in (itself, last]
@@ -4779,6 +4799,9 @@ static int ggml_cuda_try_fuse_loop_control(ggml_backend_cuda_context * cuda_ctx,
     if (!scratch || !heph_f32c(cat) || heph_overlap(add, w_f) || heph_overlap(add, w_g) || !heph_alias_ok(add, cur) || !heph_alias_ok(add, msg)) {
         return 0;
     }
+    if (add->ne[0] > 3*1024) { // the gate kernel loads three elements per thread
+        return 0;
+    }
     if (!heph_uses_confined(cgraph, i, idx[9])) {
         return 0;
     }
@@ -4949,6 +4972,9 @@ static int ggml_cuda_try_fuse_loop_control_raw(ggml_backend_cuda_context * cuda_
     const bool dense = a->nb[1] == (size_t) n*sizeof(float) && b->nb[1] == (size_t) n*sizeof(float);
     if (!scratch || heph_overlap(add, w_f) || heph_overlap(add, w_g) ||
         (heph_overlap(add, a) && !(dense && add->data == a->data)) || (heph_overlap(add, b) && !(dense && add->data == b->data))) {
+        return 0;
+    }
+    if (add->ne[0] > 3*1024) { // the gate kernel loads three elements per thread
         return 0;
     }
     if (!heph_uses_confined(cgraph, i, idx[13])) {
@@ -5164,6 +5190,140 @@ static int ggml_cuda_try_fuse_conv_state(ggml_backend_cuda_context * cuda_ctx, g
     return i_cpy - i;
 }
 
+// [SSM_CONV ADD SCALE] -> [clip chain | RMS_NORM] -> MUL_MAT with a dense 128x128 weight: one block per row.
+// Covers Q (clip, rotate), K (conv tail, clip, rotate), V (conv tail, rms_norm, rotate) and the plain output rotation.
+static int ggml_cuda_try_fuse_rot(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = heph_fuse_enabled("rot");
+    if (!enabled) {
+        return 0;
+    }
+    constexpr int64_t n_rot = 128;
+    ggml_tensor * head = cgraph->nodes[i];
+    if (head->op != GGML_OP_SSM_CONV && head->op != GGML_OP_MUL && head->op != GGML_OP_SQR && head->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+
+    heph_rot_args a = {};
+    const ggml_tensor * feed = nullptr; // output of the convolution tail
+    const ggml_tensor * x4   = nullptr;
+    const ggml_tensor * w    = nullptr;
+    int next = i;
+    if (head->op == GGML_OP_SSM_CONV) {
+        const int i_add = heph_next_real(cgraph, i + 1);
+        const int i_sc  = i_add < 0 ? -1 : heph_next_real(cgraph, i_add + 1);
+        if (i_sc < 0) {
+            return 0;
+        }
+        ggml_tensor * add = cgraph->nodes[i_add];
+        ggml_tensor * sc  = cgraph->nodes[i_sc];
+        if (add->op != GGML_OP_ADD || sc->op != GGML_OP_SCALE || sc->src[0] != add || ggml_get_op_params_f32(sc, 1) != 0.0f ||
+            heph_strip_views(add->src[1]) != head) {
+            return 0;
+        }
+        x4 = head->src[0];
+        w  = head->src[1];
+        const ggml_tensor * cur = add->src[0];
+        const int64_t n_ch = w->ne[1];
+        const int64_t n_t  = head->ne[1];
+        if (!heph_f32c(x4) || !heph_f32c(w) || !heph_f32c(cur) || !heph_f32c(sc) || w->ne[0] != 4 || ggml_nelements(w) != 4*n_ch ||
+            x4->ne[1] != n_ch || x4->ne[2] != 1 || x4->ne[3] != 1 || x4->ne[0] != 3 + n_t || head->ne[0] != n_ch || head->ne[2] != 1 ||
+            sc->ne[0] != n_ch || ggml_nelements(sc) != n_ch*n_t || cur->ne[0] != n_ch || ggml_nelements(cur) != n_ch*n_t) {
+            return 0;
+        }
+        a.x          = (const float *) cur->data;
+        a.x4         = (const float *) x4->data;
+        a.w          = (const float *) w->data;
+        a.n_ch       = n_ch;
+        a.x_len      = x4->ne[0];
+        a.conv_scale = ggml_get_op_params_f32(sc, 0);
+        feed = sc;
+        next = heph_next_real(cgraph, i_sc + 1);
+        if (next < 0) {
+            return 0;
+        }
+    }
+
+    const ggml_tensor * xin   = nullptr; // what the kernel reads rows from
+    const ggml_tensor * scale = nullptr;
+    const ggml_tensor * y     = nullptr; // what the rotation must consume
+    int i_rot = -1;
+    heph_clip c;
+    ggml_tensor * n = cgraph->nodes[next];
+    if (n->op == GGML_OP_RMS_NORM) {
+        if (!feed || heph_strip_views(n->src[0]) != feed || n->ne[0] != n_rot) {
+            return 0;
+        }
+        a.pre = HEPH_ROT_PRE_RMS;
+        a.eps = ggml_get_op_params_f32(n, 0);
+        y     = n;
+        i_rot = heph_next_real(cgraph, next + 1);
+    } else if (n->op != GGML_OP_MUL_MAT && heph_parse_clip(cgraph, next, c)) {
+        if (feed ? (heph_strip_views(c.x) != feed || c.scale != nullptr) : false) {
+            return 0;
+        }
+        a.pre = HEPH_ROT_PRE_CLIP;
+        a.thr = c.thr;
+        a.eps = c.eps;
+        scale = c.scale;
+        xin   = c.x;
+        y     = c.out;
+        i_rot = heph_next_real(cgraph, c.last + 1);
+    } else if (!feed && n->op == GGML_OP_MUL_MAT) {
+        a.pre = HEPH_ROT_PRE_NONE;
+        xin   = n->src[1];
+        i_rot = next;
+    } else {
+        return 0;
+    }
+    if (i_rot < 0) {
+        return 0;
+    }
+    ggml_tensor * out = cgraph->nodes[i_rot];
+    if (out->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+    const ggml_tensor * rot = out->src[0];
+    const ggml_tensor * rin = out->src[1];
+    if (rot->op != GGML_OP_NONE || !heph_f32c(rot) || rot->ne[0] != n_rot || rot->ne[1] != n_rot || ggml_nelements(rot) != n_rot*n_rot ||
+        !heph_f32c(out) || !heph_f32c(rin) || rin->ne[0] != n_rot || out->ne[0] != n_rot || ggml_nelements(out) != ggml_nelements(rin) ||
+        (y && heph_strip_views(rin) != y)) {
+        return 0;
+    }
+    const int64_t n_el = ggml_nelements(out);
+    if (feed ? ggml_nelements(feed) != n_el : (!heph_f32c(xin) || xin->ne[0] != n_rot || ggml_nelements(xin) != n_el)) {
+        return 0;
+    }
+    if (scale) {
+        if (heph_overlap(out, scale)) {
+            return 0;
+        }
+        a.scale      = (const float *) scale->data;
+        a.scale_rows = ggml_nelements(scale) / n_rot;
+    }
+    // a block reads its whole row before it writes it, so the output may sit exactly on the row source, nowhere else
+    if (heph_overlap(out, rot) || (feed && (heph_overlap(out, x4) || heph_overlap(out, w)))) {
+        return 0;
+    }
+    if (feed) {
+        const ggml_tensor * cur = cgraph->nodes[heph_next_real(cgraph, i + 1)]->src[0];
+        if (!heph_alias_ok(out, cur)) {
+            return 0;
+        }
+    } else {
+        if (!heph_alias_ok(out, xin)) {
+            return 0;
+        }
+        a.x = (const float *) xin->data;
+    }
+    if (i_rot != i && !heph_uses_confined(cgraph, i, i_rot)) {
+        return 0;
+    }
+    a.rot = (const float *) rot->data;
+    a.dst = (float *) out->data;
+    ggml_cuda_op_rot_rows(*cuda_ctx, a, n_el / n_rot);
+    return i_rot == i ? HEPH_FUSED_SELF : i_rot - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -5175,6 +5335,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (cuda_ctx->stream_context().concurrent_events.empty()) {
         if (const int n = ggml_cuda_try_fuse_conv_state(cuda_ctx, cgraph, i)) {
+            ++ggml_cuda_heph_fuse_count;
+            return n;
+        }
+        if (const int n = ggml_cuda_try_fuse_rot(cuda_ctx, cgraph, i)) {
             ++ggml_cuda_heph_fuse_count;
             return n;
         }
@@ -6224,6 +6388,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (dump_nodes) { dump_node(i, nodes_to_skip ? "FUSEHEAD" : "single"); for (int k = 1; k <= nodes_to_skip; ++k) dump_node(i + k, "fused"); }
+                if (nodes_to_skip == HEPH_FUSED_SELF) {
+                    continue;
+                }
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
