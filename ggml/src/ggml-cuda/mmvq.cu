@@ -1544,6 +1544,8 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+extern "C" { extern int ggml_cuda_heph_fuse_count; }
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1641,12 +1643,38 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    const size_t  q8_1_size   = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    const char * src1_q = nullptr;
+    // HEPH: one vector read by several matvecs (Q, relative bias, sinks and gate share their input) is quantized once.
+    // A tensor with pending consumers keeps its buffer untouched, and the cache is dropped at the start of every evaluation.
+    constexpr size_t heph_qcache_bytes = 64*1024;
+    static const bool heph_qcache_on = !(getenv("GGML_CUDA_HEPH_FUSE") && getenv("GGML_CUDA_HEPH_FUSE")[0] == '0') &&
+                                       !(getenv("GGML_CUDA_HEPH_NOFUSE") && strstr(getenv("GGML_CUDA_HEPH_NOFUSE"), "qcache"));
+    // only computed, non-view tensors: those are written once, by their own node
+    if (heph_qcache_on && !ids && ne11 == 1 && ne12 == 1 && ne13 == 1 && q8_1_size <= heph_qcache_bytes &&
+        src1->op != GGML_OP_NONE && src1->view_src == nullptr) {
+        auto & qc = ctx.heph_qcache;
+        if (qc.buf == nullptr) {
+            CUDA_CHECK(cudaMalloc((void **) &qc.buf, heph_qcache_bytes));
+        }
+        if (qc.key == src1 && qc.data == src1->data && qc.ne10 == ne10) {
+            ++ggml_cuda_heph_fuse_count;
+        } else {
+            quantize_row_q8_1_cuda(src1_d, qc.buf, ne10, src1->nb[1] / ts_src1, src1->nb[2] / ts_src1, src1->nb[3] / ts_src1,
+                ne10_padded, ne11, ne12, ne13, stream);
+            qc.key  = src1;
+            qc.data = src1->data;
+            qc.ne10 = ne10;
+        }
+        src1_q = qc.buf;
+    } else {
+        src1_q8_1.alloc(q8_1_size);
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
         quantize_row_q8_1_cuda(src1_d, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        src1_q = src1_q8_1.get();
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1672,7 +1700,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

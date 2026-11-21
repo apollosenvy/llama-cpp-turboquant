@@ -43,16 +43,17 @@ void ggml_cuda_op_moe_weights_norm(ggml_backend_cuda_context & ctx, const ggml_t
 // relative-position attention bias joined with the mask, F16 out:
 // dst[k, t, h] = f16((rel_pos[k, t] < n_extent ? <bias[:, rel_pos[k, t]], r[:, h, t]> : 0) - sinks[h, t] + mask[k, t])
 void ggml_cuda_op_rel_bias_mask(ggml_backend_cuda_context & ctx, const ggml_tensor * bias, const void * r,
-                                const ggml_tensor * sinks, const ggml_tensor * rel_pos, const ggml_tensor * mask, ggml_tensor * dst,
-                                void * scratch);
+                                const void * sinks, const ggml_tensor * rel_pos, const ggml_tensor * mask, ggml_tensor * dst,
+                                void * scratch, ggml_tensor * fill, float fill_v);
 
 // convolve() head: concat of the recurrent past with the new columns, plus the state store
 void ggml_cuda_op_conv_concat_store(ggml_backend_cuda_context & ctx, const ggml_tensor * past, const ggml_tensor * cur,
                                     ggml_tensor * cat, void * state, int n_t);
 
 // whole convolve() without dynamic taps (n_conv == 4): state store, convolution, residual and scale in one kernel
+// res: optional residual stream added to the result (the layer's residual add that follows convolve())
 void ggml_cuda_op_conv_full(ggml_backend_cuda_context & ctx, const ggml_tensor * past, const ggml_tensor * cur, const ggml_tensor * w,
-                            ggml_tensor * dst, void * state, float scale);
+                            const ggml_tensor * res, ggml_tensor * dst, void * state, float scale);
 
 #define HEPH_ROT_PRE_NONE 0
 #define HEPH_ROT_PRE_CLIP 1

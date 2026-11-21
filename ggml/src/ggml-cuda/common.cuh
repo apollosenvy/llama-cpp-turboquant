@@ -1427,6 +1427,15 @@ struct ggml_backend_cuda_context {
 
     std::unique_ptr<ggml_cuda_stream_context> concurrent_stream_context;
 
+    // HEPH: quantized copy of the latest single-vector mul_mat_vec_q input. Matvecs that read the same tensor within one
+    // graph evaluation share it instead of each launching a quantize kernel. Reset at the start of every evaluation.
+    struct {
+        const ggml_tensor * key  = nullptr;
+        const void *        data = nullptr;
+        int64_t             ne10 = 0;
+        char *              buf  = nullptr;
+    } heph_qcache;
+
     ~ggml_backend_cuda_context();
 
     cudaStream_t stream(int device, int stream) {

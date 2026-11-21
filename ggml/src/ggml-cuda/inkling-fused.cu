@@ -540,9 +540,13 @@ void ggml_cuda_op_moe_weights_norm(ggml_backend_cuda_context & ctx, const ggml_t
 
 static __global__ void rel_bias_mask_f16(const float * bias, const float * r, const float * sinks, const int32_t * rel_pos,
                                          const half * mask, half * dst, const int n_rel, const int n_extent,
-                                         const int64_t n_kv, const int64_t n_tokens, const int64_t n) {
+                                         const int64_t n_kv, const int64_t n_tokens, const int64_t n,
+                                         float * fill, const int fill_n, const float fill_v) {
     ggml_cuda_pdl_lc();
     const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (idx < fill_n) { // an unrelated small constant fill that follows the chain in the graph rides along
+        fill[idx] = fill_v;
+    }
     if (idx >= n) {
         return;
     }
@@ -580,16 +584,19 @@ static __global__ void rel_bias_mask_f16(const float * bias, const float * r, co
 }
 
 void ggml_cuda_op_rel_bias_mask(ggml_backend_cuda_context & ctx, const ggml_tensor * bias, const void * r,
-                                const ggml_tensor * sinks, const ggml_tensor * rel_pos, const ggml_tensor * mask, ggml_tensor * dst,
-                                void * scratch) {
+                                const void * sinks, const ggml_tensor * rel_pos, const ggml_tensor * mask, ggml_tensor * dst,
+                                void * scratch, ggml_tensor * fill, float fill_v) {
     const int     n_rel    = bias->ne[0];
     const int     n_extent = bias->ne[1];
     const int64_t n_kv     = dst->ne[0];
     const int64_t n_tokens = dst->ne[1];
     const int64_t n        = ggml_nelements(dst);
+    const int     fill_n   = fill ? (int) ggml_nelements(fill) : 0;
+    GGML_ASSERT(fill_n <= n);
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3((n + 255) / 256, 1, 1), dim3(256, 1, 1), 0, ctx.stream());
-    ggml_cuda_kernel_launch(rel_bias_mask_f16, lp, (const float *) bias->data, (const float *) r, (const float *) sinks->data,
-        (const int32_t *) rel_pos->data, (const half *) mask->data, (half *) (scratch ? scratch : dst->data), n_rel, n_extent, n_kv, n_tokens, n);
+    ggml_cuda_kernel_launch(rel_bias_mask_f16, lp, (const float *) bias->data, (const float *) r, (const float *) sinks,
+        (const int32_t *) rel_pos->data, (const half *) mask->data, (half *) (scratch ? scratch : dst->data), n_rel, n_extent, n_kv, n_tokens, n,
+        fill ? (float *) fill->data : nullptr, fill_n, fill_v);
     if (scratch) {
         // dst shares memory with an input the kernel reads; the kernel wrote to scratch instead
         CUDA_CHECK(cudaMemcpyAsync(dst->data, scratch, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, ctx.stream()));
@@ -628,10 +635,10 @@ void ggml_cuda_op_conv_concat_store(ggml_backend_cuda_context & ctx, const ggml_
 }
 
 // whole convolve() without dynamic taps, the concat buffer is never materialised:
-// dst[c, t] = (cur[c, t] + sum_j x4[t + j, c]*w[j, c])*scale, state[c, j] = x4[n_t + j, c]
+// dst[c, t] = (cur[c, t] + sum_j x4[t + j, c]*w[j, c])*scale [+ res[c, t]], state[c, j] = x4[n_t + j, c]
 template <int n_conv>
-static __global__ void conv_full_f32(const float * past, const int64_t past_stride, const float * cur, const float * w, float * dst,
-                                     float * state, const int n_t, const int n_ch, const int64_t n, const float scale) {
+static __global__ void conv_full_f32(const float * past, const int64_t past_stride, const float * cur, const float * w, const float * res,
+                                     float * dst, float * state, const int n_t, const int n_ch, const int64_t n, const float scale) {
     ggml_cuda_pdl_lc();
     const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
     if (idx >= n) {
@@ -656,7 +663,8 @@ static __global__ void conv_full_f32(const float * past, const int64_t past_stri
     for (int j = 0; j < n_conv; ++j) {
         sum += v[j]*wv[j];
     }
-    dst[idx] = (v[n_past] + sum)*scale; // v[n_past] is cur[c, t]
+    const float out = (v[n_past] + sum)*scale; // v[n_past] is cur[c, t]
+    dst[idx] = res ? res[idx] + out : out;
     if (t == n_t - 1) {
 #pragma unroll
         for (int j = 0; j < n_past; ++j) {
@@ -666,14 +674,15 @@ static __global__ void conv_full_f32(const float * past, const int64_t past_stri
 }
 
 void ggml_cuda_op_conv_full(ggml_backend_cuda_context & ctx, const ggml_tensor * past, const ggml_tensor * cur, const ggml_tensor * w,
-                            ggml_tensor * dst, void * state, float scale) {
+                            const ggml_tensor * res, ggml_tensor * dst, void * state, float scale) {
     GGML_ASSERT(w->ne[0] == 4);
     const int     n_ch = w->ne[1];
     const int64_t n    = ggml_nelements(dst);
     const int     n_t  = n / n_ch;
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3((n + 255) / 256, 1, 1), dim3(256, 1, 1), 0, ctx.stream());
     ggml_cuda_kernel_launch(conv_full_f32<4>, lp, (const float *) past->data, (int64_t) (past->nb[1] / sizeof(float)),
-        (const float *) cur->data, (const float *) w->data, (float *) dst->data, (float *) state, n_t, n_ch, n, scale);
+        (const float *) cur->data, (const float *) w->data, res ? (const float *) res->data : nullptr, (float *) dst->data, (float *) state,
+        n_t, n_ch, n, scale);
 }
 
 // Row transform + dense rotation, one block per row of n_rot elements:

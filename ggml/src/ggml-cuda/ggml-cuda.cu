@@ -995,6 +995,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (heph_qcache.buf != nullptr) {
+        CUDA_CHECK(cudaFree(heph_qcache.buf));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -5017,13 +5020,31 @@ static int ggml_cuda_try_fuse_moe_weights_norm(ggml_backend_cuda_context * cuda_
 }
 
 // MUL_MAT(pad(bias), r) | MUL_MAT sinks (kept) | SUB CONT GET_ROWS CONT | CPY(mask to f32) ADD CPY(to f16)
-static int ggml_cuda_try_fuse_rel_bias_mask(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+static int ggml_cuda_try_fuse_rel_bias_mask(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i, bool dry = false) {
     static const bool enabled = heph_fuse_enabled("relbias");
-    ggml_tensor * table = cgraph->nodes[i];
-    if (!enabled || table->op != GGML_OP_MUL_MAT || table->src[0]->op != GGML_OP_PAD) {
+    if (!enabled) {
         return 0;
     }
-    int idx[9] = { i };
+    // The chain may start at the clip() of r. Then r and the sink logits are written straight to buffers the output
+    // does not overlap, and nothing has to be copied. Starting at the table product is the fallback.
+    heph_clip c;
+    bool has_clip = false;
+    int  i_table  = i;
+    if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT) {
+        if (!heph_parse_clip(cgraph, i, c)) {
+            return 0;
+        }
+        i_table = heph_next_real(cgraph, c.last + 1);
+        if (i_table < 0 || ggml_node_get_use_count(cgraph, c.last) != 1 || (c.out->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+        has_clip = true;
+    }
+    ggml_tensor * table = cgraph->nodes[i_table];
+    if (table->op != GGML_OP_MUL_MAT || table->src[0]->op != GGML_OP_PAD || (has_clip && table->src[1] != c.out)) {
+        return 0;
+    }
+    int idx[9] = { i_table };
     static const enum ggml_op ops[9] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_SUB, GGML_OP_CONT, GGML_OP_GET_ROWS, GGML_OP_CONT,
                                          GGML_OP_CPY, GGML_OP_ADD, GGML_OP_CPY };
     for (int k = 1; k < 9; ++k) {
@@ -5077,20 +5098,121 @@ static int ggml_cuda_try_fuse_rel_bias_mask(ggml_backend_cuda_context * cuda_ctx
     if (heph_overlap(out, bias) || heph_overlap(out, rel_pos) || heph_overlap(out, mask)) {
         return 0;
     }
-    if (!heph_uses_confined(cgraph, i, idx[8])) {
+    if (!heph_uses_confined(cgraph, i_table, idx[8])) {
         return 0;
     }
+
+    // the zero fill of the attention sinks follows the chain: let the kernel write it
+    ggml_tensor * fill = nullptr;
+    int last = idx[8];
+    {
+        const int i_fill = heph_next_real(cgraph, idx[8] + 1);
+        if (i_fill >= 0) {
+            ggml_tensor * f = cgraph->nodes[i_fill];
+            if (f->op == GGML_OP_FILL && heph_f32c(f) && ggml_nelements(f) <= n_head*n_tokens*n_kv && ggml_nelements(f) <= 4096 &&
+                !heph_overlap(f, out) && !heph_overlap(f, bias) && !heph_overlap(f, rel_pos) && !heph_overlap(f, mask)) {
+                fill = f;
+                last = i_fill;
+            }
+        }
+    }
+    const float fill_v = fill ? ggml_get_op_params_f32(fill, 0) : 0.0f;
+
+    if (has_clip) {
+        const ggml_tensor * sink_in = sinks->src[1];
+        // nothing the kernels still read, and nothing they write, may be hit by a scratch
+        auto clear = [&](const void * p, size_t nbytes, std::initializer_list<const ggml_tensor *> more) {
+            auto hits = [&](const ggml_tensor * t) {
+                const char * a0 = (const char *) p;
+                const char * b0 = (const char *) t->data;
+                return a0 < b0 + ggml_nbytes(t) && b0 < a0 + nbytes;
+            };
+            for (const ggml_tensor * t : { bias, rel_pos, mask, (const ggml_tensor *) out, sink_in }) {
+                if (hits(t)) {
+                    return false;
+                }
+            }
+            if (fill && hits(fill)) {
+                return false;
+            }
+            for (const ggml_tensor * t : more) {
+                if (t && hits(t)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        // r: its own buffer when the output leaves it alone (the clip kernel tolerates an exact alias with its input)
+        void * r_loc = nullptr;
+        if (clear(c.out->data, ggml_nbytes(c.out), { c.scale }) && heph_alias_ok(c.out, c.x)) {
+            r_loc = c.out->data;
+        } else {
+            for (ggml_tensor * cand : { table, sub, cont1, rows, cont2, add }) {
+                if (ggml_nbytes(cand) >= ggml_nbytes(c.out) && clear(cand->data, ggml_nbytes(c.out), { c.scale, c.x })) {
+                    r_loc = cand->data;
+                    break;
+                }
+            }
+        }
+        if (!r_loc) {
+            return 0;
+        }
+        // sink logits: their own buffer, or a scratch clear of r
+        const size_t r_bytes = ggml_nbytes(c.out);
+        auto hits_r = [&](const void * p, size_t nbytes) {
+            const char * a0 = (const char *) p;
+            const char * b0 = (const char *) r_loc;
+            return a0 < b0 + r_bytes && b0 < a0 + nbytes;
+        };
+        void * s_loc = nullptr;
+        if (clear(sinks->data, ggml_nbytes(sinks), {}) && !hits_r(sinks->data, ggml_nbytes(sinks))) {
+            s_loc = sinks->data;
+        } else {
+            for (ggml_tensor * cand : { table, sub, cont1, rows, cont2, add }) {
+                // a candidate that holds r is used from its far end
+                if (ggml_nbytes(cand) < ggml_nbytes(sinks)) {
+                    continue;
+                }
+                char * p = (char *) cand->data + ggml_nbytes(cand) - ggml_nbytes(sinks);
+                if (clear(p, ggml_nbytes(sinks), {}) && !hits_r(p, ggml_nbytes(sinks))) {
+                    s_loc = p;
+                    break;
+                }
+            }
+        }
+        if (!s_loc) {
+            return 0;
+        }
+        if (dry) {
+            return last - i;
+        }
+        ggml_tensor r_tmp = *c.out;
+        r_tmp.data = r_loc;
+        ggml_cuda_op_clip_rows(*cuda_ctx, c.x, c.scale, &r_tmp, c.thr, c.eps, 1.0f);
+        ggml_tensor s_tmp = *sinks;
+        s_tmp.data = s_loc;
+        if (!ggml_cuda_compute_forward(*cuda_ctx, &s_tmp)) {
+            GGML_ABORT("rel_bias fusion: sink projection failed");
+        }
+        ggml_cuda_op_rel_bias_mask(*cuda_ctx, bias, r_loc, s_loc, rel_pos, mask, out, nullptr, fill, fill_v);
+        return last - i;
+    }
+
     // Buffers of the nodes this fusion elides serve as scratch. A scratch must not overlap anything the kernel reads or writes.
     auto pick_scratch = [&](size_t nbytes, const ggml_tensor * avoid) -> ggml_tensor * {
         for (ggml_tensor * cand : { cont2, add, rows, cont1, sub, table }) {
             if (cand != avoid && ggml_nbytes(cand) >= nbytes && !heph_overlap(cand, r) && !heph_overlap(cand, sinks) &&
                 !heph_overlap(cand, bias) && !heph_overlap(cand, rel_pos) && !heph_overlap(cand, mask) && !heph_overlap(cand, out) &&
-                (!avoid || !heph_overlap(cand, avoid))) {
+                (!fill || !heph_overlap(cand, fill)) && (!avoid || !heph_overlap(cand, avoid))) {
                 return cand;
             }
         }
         return nullptr;
     };
+    if (fill && (heph_overlap(fill, r) || heph_overlap(fill, sinks))) {
+        fill = nullptr;
+        last = idx[8];
+    }
     // sinks is computed here, one node early. If the allocator put it on r (whose last graph use is the table), keep a copy of r.
     ggml_tensor * r_copy = nullptr;
     if (heph_overlap(sinks, r)) {
@@ -5107,14 +5229,49 @@ static int ggml_cuda_try_fuse_rel_bias_mask(ggml_backend_cuda_context * cuda_ctx
             return 0;
         }
     }
+    if (dry) {
+        return last - i;
+    }
     if (r_copy) {
         CUDA_CHECK(cudaMemcpyAsync(r_copy->data, r->data, ggml_nbytes(r), cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
     }
     if (!ggml_cuda_compute_forward(*cuda_ctx, sinks)) {
         GGML_ABORT("rel_bias fusion: sink projection failed");
     }
-    ggml_cuda_op_rel_bias_mask(*cuda_ctx, bias, r_copy ? r_copy->data : r->data, sinks, rel_pos, mask, out, target ? target->data : nullptr);
-    return idx[8] - i;
+    ggml_cuda_op_rel_bias_mask(*cuda_ctx, bias, r_copy ? r_copy->data : r->data, sinks->data, rel_pos, mask, out,
+        target ? target->data : nullptr, fill, fill_v);
+    return last - i;
+}
+
+// The zero-padded copy of the relative bias table is only read by a product the fusion above replaces
+// with a kernel that reads the unpadded table. When that fusion is going to fire, the pad is never needed.
+static int ggml_cuda_try_skip_rel_pad(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = heph_fuse_enabled("relpad");
+    ggml_tensor * pad = cgraph->nodes[i];
+    if (!enabled || pad->op != GGML_OP_PAD || ggml_node_get_use_count(cgraph, i) != 1 || (pad->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    int i_table = -1;
+    for (int k = i + 1; k < cgraph->n_nodes && k <= i + 64; ++k) {
+        if (cgraph->nodes[k]->op == GGML_OP_MUL_MAT && cgraph->nodes[k]->src[0] == pad) {
+            i_table = k;
+            break;
+        }
+    }
+    if (i_table < 0) {
+        return 0;
+    }
+    // walk the nodes in between the way the evaluation loop will, and see whether a fusion swallows the product
+    for (int k = i + 1; k <= i_table; ++k) {
+        if (ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+            continue;
+        }
+        const int n = ggml_cuda_try_fuse_rel_bias_mask(cuda_ctx, cgraph, k, true);
+        if (n > 0) {
+            return k + n >= i_table ? HEPH_FUSED_SELF : 0;
+        }
+    }
+    return 0;
 }
 
 // convolve(): CONCAT(past, x) CPY(state store) [SSM_CONV ADD SCALE]
@@ -5171,14 +5328,31 @@ static int ggml_cuda_try_fuse_conv_state(ggml_backend_cuda_context * cuda_ctx, g
             const ggml_tensor * w   = conv->src[1];
             const bool tail = add->op == GGML_OP_ADD && sc->op == GGML_OP_SCALE && sc->src[0] == add &&
                 ggml_get_op_params_f32(sc, 1) == 0.0f && heph_strip_views(add->src[1]) == conv && add->src[0] == cur;
+            // the layer's residual add right behind joins the kernel
+            const ggml_tensor * res  = nullptr;
+            ggml_tensor *       dst  = sc;
+            int                 last = i_sc;
+            const int i_res = heph_next_real(cgraph, i_sc + 1);
+            if (tail && i_res >= 0 && cgraph->nodes[i_res]->op == GGML_OP_ADD && ggml_node_get_use_count(cgraph, i_sc) == 1 &&
+                !(sc->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                ggml_tensor *       radd  = cgraph->nodes[i_res];
+                const ggml_tensor * other = radd->src[0] == sc ? radd->src[1] : radd->src[1] == sc ? radd->src[0] : nullptr;
+                if (other && other != sc && heph_f32c(other) && heph_f32c(radd) && ggml_are_same_shape(other, sc) &&
+                    ggml_are_same_shape(radd, sc) && heph_alias_ok(radd, other)) {
+                    res  = other;
+                    dst  = radd;
+                    last = i_res;
+                }
+            }
             if (tail && n_past == 3 && heph_f32c(w) && w->ne[0] == 4 && w->ne[1] == n_ch && ggml_nelements(w) == 4*n_ch &&
                 heph_f32c(sc) && sc->ne[0] == n_ch && ggml_nelements(sc) == n_ch*n_t &&
                 !(cat->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(cgraph, i) == 2 &&
                 heph_uses_confined(cgraph, i_conv, i_sc) &&
-                !heph_overlap(sc, past) && !heph_overlap(sc, w) && !heph_overlap(sc, cpy) && !heph_overlap(cpy, w) &&
-                (n_t == 1 ? heph_alias_ok(sc, cur) : !heph_overlap(sc, cur))) {
-                ggml_cuda_op_conv_full(*cuda_ctx, past, cur, w, sc, cpy->data, ggml_get_op_params_f32(sc, 0));
-                return i_sc - i;
+                !heph_overlap(dst, past) && !heph_overlap(dst, w) && !heph_overlap(dst, cpy) && !heph_overlap(cpy, w) &&
+                (!res || !heph_overlap(cpy, res)) &&
+                (n_t == 1 ? heph_alias_ok(dst, cur) : !heph_overlap(dst, cur))) {
+                ggml_cuda_op_conv_full(*cuda_ctx, past, cur, w, res, dst, cpy->data, ggml_get_op_params_f32(sc, 0));
+                return last - i;
             }
         }
     }
@@ -5342,15 +5516,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ++ggml_cuda_heph_fuse_count;
             return n;
         }
+        if (const int n = ggml_cuda_try_fuse_rel_bias_mask(cuda_ctx, cgraph, i)) {
+            ++ggml_cuda_heph_fuse_count;
+            return n;
+        }
+        if (const int n = ggml_cuda_try_skip_rel_pad(cuda_ctx, cgraph, i)) {
+            ++ggml_cuda_heph_fuse_count;
+            return n;
+        }
         if (const int n = ggml_cuda_try_fuse_clip_rows(cuda_ctx, cgraph, i)) {
             ++ggml_cuda_heph_fuse_count;
             return n;
         }
         if (const int n = ggml_cuda_try_fuse_mix(cuda_ctx, cgraph, i)) {
-            ++ggml_cuda_heph_fuse_count;
-            return n;
-        }
-        if (const int n = ggml_cuda_try_fuse_rel_bias_mask(cuda_ctx, cgraph, i)) {
             ++ggml_cuda_heph_fuse_count;
             return n;
         }
@@ -6213,6 +6391,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+    cuda_ctx->heph_qcache.key = nullptr; // tensors keep their addresses across evaluations, their contents do not
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu

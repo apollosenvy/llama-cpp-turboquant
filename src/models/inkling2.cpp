@@ -417,6 +417,10 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     cur = ggml_add(ctx0, ffn_inp, cur);
     cb(cur, "l_out", il);
 
+    // Place the convolution tail and this add right behind the state store in the graph, ahead of the next layer's
+    // state load, so a backend can run the store, the convolution and the residual as one kernel. Node order only.
+    ggml_build_forward_expand(gf, cur);
+
     return cur;
 }
 
