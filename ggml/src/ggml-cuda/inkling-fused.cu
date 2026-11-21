@@ -1,4 +1,5 @@
 #include "inkling-fused.cuh"
+#include "turbo3.cuh"
 
 template <int block_size>
 static __global__ void clip_rows_f32(const float * x, const float * scale, float * dst,
@@ -945,8 +946,69 @@ static __global__ void row_jobs_f32(const heph_row_jobs jobs) {
             acc += r[u]*s_y[k0 + u];
         }
     }
-    j.dst[idx] = acc;
+    if (!(j.t3 && j.skip_f32)) {
+        j.dst[idx] = acc;
+    }
+    if (j.t3 == nullptr) {
+        return;
+    }
+
+    // ggml_turbo3_pack() over the block: the row is one 128-element cache block
+    __shared__ uint8_t s_code[n_rot];
+    const int lane = tid % WARP_SIZE;
+    float part = warp_reduce_sum(acc*acc);
+    if (lane == 0) {
+        s_sum[tid / WARP_SIZE] = part;
+    }
+    __syncthreads();
+    float norm_sq = 0.0f;
+#pragma unroll
+    for (int k = 0; k < n_rot / WARP_SIZE; ++k) {
+        norm_sq += s_sum[k];
+    }
+    const float norm      = sqrtf(norm_sq);
+    const float inv_norm  = norm > 0.0f ? 1.0f/norm : 0.0f;
+    const float xn        = acc*inv_norm;
+    const float magnitude = fabsf(xn);
+    const int   level     = (magnitude >= 0.043589f) + (magnitude >= 0.091775f) + (magnitude >= 0.154259f);
+    const int   code      = xn < 0.0f ? 3 - level : 4 + level;
+    s_code[tid] = (uint8_t) code;
+    part = warp_reduce_sum(turbo3_centroids[code]*turbo3_centroids[code]);
+    __syncthreads(); // every thread has read the norm partials
+    if (lane == 0) {
+        s_sum[tid / WARP_SIZE] = part;
+    }
+    __syncthreads();
+
+    const int64_t t    = row / j.t3_heads;
+    const int     head = row % j.t3_heads;
+    block_turbo3_0 * blk = (block_turbo3_0 *) ((char *) j.t3 + j.t3_idx[t]*j.t3_row_bytes) + head;
+    if (tid < QK_TURBO3/4) {
+        unsigned low = 0;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            low |= (s_code[4*tid + k] & 3u) << (2*k);
+        }
+        blk->qs[tid] = (uint8_t) low;
+    }
+    if (tid < QK_TURBO3/8) {
+        unsigned high = 0;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            high |= (unsigned) (s_code[8*tid + k] >> 2) << k;
+        }
+        blk->signs[tid] = (uint8_t) high;
+    }
+    if (tid == 0) {
+        float recon_sq = 0.0f;
+#pragma unroll
+        for (int k = 0; k < n_rot / WARP_SIZE; ++k) {
+            recon_sq += s_sum[k];
+        }
+        blk->norm = __float2half(norm/sqrtf(recon_sq));
+    }
 }
+static_assert(QK_TURBO3 == 128, "a row job stores one turbo3 block per row");
 
 void ggml_cuda_op_row_jobs(ggml_backend_cuda_context & ctx, const heph_row_jobs & jobs) {
     GGML_ASSERT(jobs.n >= 1 && jobs.n <= HEPH_ROW_MAX_JOBS);

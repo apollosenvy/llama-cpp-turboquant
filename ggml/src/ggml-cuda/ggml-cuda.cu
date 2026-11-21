@@ -5645,6 +5645,7 @@ static int ggml_cuda_try_fuse_normq(ggml_backend_cuda_context * cuda_ctx, ggml_c
 //   clip unit:  [MUL] SQR SUM_ROWS SQRT SCALE FILL DIV CLAMP MUL                         (Q, relative-bias r)
 //   conv unit:  CONCAT SSM_CONV ADD SCALE (clip chain | RMS_NORM) CPY(state store)        (K, V)
 //   then any MUL_MAT with a dense 128x128 weight on a unit's output                        (Q, K, V rotations)
+//   then any SET_ROWS of a rotated output into a turbo3 cache                              (K, V cache stores)
 struct heph_row_unit {
     heph_row_job        job;
     const ggml_tensor * out_pre;   // node the pre stage ends in
@@ -5821,6 +5822,51 @@ static int ggml_cuda_try_fuse_post_proj(ggml_backend_cuda_context * cuda_ctx, gg
         units[which].out     = node;
         units[which].job.rot = (const float *) rot->data;
         rots[which]          = rot;
+        last = k;
+        k = heph_next_real(cgraph, k + 1);
+    }
+    // then the turbo3 cache stores of rotated rows (K and V): SET_ROWS(cache, rows, token index)
+    while (k >= 0) {
+        ggml_tensor * node = cgraph->nodes[k];
+        if (node->op != GGML_OP_SET_ROWS || node->type != GGML_TYPE_TURBO3_0) {
+            break;
+        }
+        // the store reads the rotation through a 2D view of all of it (ggml_view_2d in llama_kv_cache::cpy_k)
+        const ggml_tensor * rows = node->src[0]->view_src && node->src[0]->view_offs == 0 ? node->src[0]->view_src : heph_strip_views(node->src[0]);
+        const ggml_tensor * tok  = node->src[1];
+        int which = -1;
+        for (int u = 0; u < n; ++u) {
+            if (units[u].out == rows && rots[u] != nullptr && units[u].job.t3 == nullptr) {
+                which = u;
+            }
+        }
+        if (which < 0) {
+            break;
+        }
+        const heph_row_unit & u = units[which];
+        const int64_t n_t   = ggml_nelements(tok);
+        const int64_t heads = n_t > 0 ? u.n_el / 128 / n_t : 0;
+        if (tok->type != GGML_TYPE_I64 || !ggml_is_contiguous(tok) || n_t < 1 || heads < 1 || heads*128*n_t != u.n_el ||
+            node->ne[0] != heads*128 || node->ne[2] != 1 || node->ne[3] != 1 || node->src[0]->ne[0] != heads*128 ||
+            node->src[0]->ne[1] != n_t || ggml_nelements(node->src[0]) != u.n_el || node->src[0]->data != u.out->data ||
+            node->nb[1] != (size_t) heads*sizeof(block_turbo3_0) || (u.out->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            break;
+        }
+        // which node of the graph is the rotation
+        int i_rot = -1;
+        for (int q = k - 1; q > i && i_rot < 0; --q) {
+            if (cgraph->nodes[q] == u.out) {
+                i_rot = q;
+            }
+        }
+        if (i_rot < 0) {
+            break;
+        }
+        units[which].job.t3           = node->data;
+        units[which].job.t3_idx       = (const int64_t *) tok->data;
+        units[which].job.t3_row_bytes = node->nb[1];
+        units[which].job.t3_heads     = heads;
+        units[which].job.skip_f32     = ggml_node_get_use_count(cgraph, i_rot) == 1;
         last = k;
         k = heph_next_real(cgraph, k + 1);
     }
