@@ -5754,11 +5754,15 @@ static int ggml_cuda_try_fuse_mmv_group(ggml_backend_cuda_context * cuda_ctx, gg
         nodes[n++] = node;
         last = k;
     }
-    if (n < 2) {
+    // A lone matvec also goes through the multi-row kernel when the matrix is large enough: the generic kernel reads
+    // the 2304 x 2304 output projection at 56% of the card's bandwidth (11.3 us), this one at the rate of the grouped
+    // projections. GGML_CUDA_HEPH_MMV1_ROWS=<min rows> moves the limit, 0 keeps single matvecs on the generic kernel.
+    static const int64_t single_min_rows = getenv("GGML_CUDA_HEPH_MMV1_ROWS") ? atoll(getenv("GGML_CUDA_HEPH_MMV1_ROWS")) : 1024;
+    if (n < 2 && !(n == 1 && single_min_rows > 0 && nodes[0]->src[0]->ne[1] >= single_min_rows)) {
         return 0;
     }
     ggml_cuda_op_mmv_q8_0_multi(*cuda_ctx, nodes, n);
-    return last - i;
+    return n == 1 ? HEPH_FUSED_SELF : last - i;
 }
 
 // RMS_NORM MUL(weight) on one vector: the kernel also writes the q8_1 form the following matvecs read
