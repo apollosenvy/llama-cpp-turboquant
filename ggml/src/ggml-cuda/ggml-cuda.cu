@@ -4876,6 +4876,120 @@ static int ggml_cuda_try_fuse_conv_res_scale(ggml_backend_cuda_context * cuda_ct
     return i_sc - i;
 }
 
+// control() with its inputs: CONT RMS_NORM CONT RMS_NORM | CONCAT MUL_MAT | MUL_MAT TANH MUL SUB | MUL_MAT TANH MUL ADD
+static int ggml_cuda_try_fuse_loop_control_raw(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = heph_fuse_enabled("controlraw");
+    if (!enabled || cgraph->nodes[i]->op != GGML_OP_CONT) {
+        return 0;
+    }
+    int idx[14] = { i };
+    static const enum ggml_op ops[14] = { GGML_OP_CONT, GGML_OP_RMS_NORM, GGML_OP_CONT, GGML_OP_RMS_NORM,
+                                          GGML_OP_CONCAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB,
+                                          GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
+    for (int k = 1; k < 14; ++k) {
+        idx[k] = heph_next_real(cgraph, idx[k - 1] + 1);
+        if (idx[k] < 0 || cgraph->nodes[idx[k]]->op != ops[k]) {
+            return 0;
+        }
+    }
+    ggml_tensor * ca   = cgraph->nodes[idx[0]];
+    ggml_tensor * ra   = cgraph->nodes[idx[1]];
+    ggml_tensor * cb   = cgraph->nodes[idx[2]];
+    ggml_tensor * rb   = cgraph->nodes[idx[3]];
+    ggml_tensor * cat  = cgraph->nodes[idx[4]];
+    ggml_tensor * gate = cgraph->nodes[idx[5]];
+    ggml_tensor * mf   = cgraph->nodes[idx[6]];
+    ggml_tensor * tf   = cgraph->nodes[idx[7]];
+    ggml_tensor * fc   = cgraph->nodes[idx[8]];
+    ggml_tensor * sub  = cgraph->nodes[idx[9]];
+    ggml_tensor * mg   = cgraph->nodes[idx[10]];
+    ggml_tensor * tg   = cgraph->nodes[idx[11]];
+    ggml_tensor * gm   = cgraph->nodes[idx[12]];
+    ggml_tensor * add  = cgraph->nodes[idx[13]];
+
+    if (ggml_get_op_params_i32(cat, 0) != 0 || ra->src[0] != ca || rb->src[0] != cb || cat->src[0] != ra || cat->src[1] != rb ||
+        gate->src[1] != cat || mf->src[1] != gate || tf->src[0] != mf || fc->src[0] != tf || fc->src[1] != ca ||
+        sub->src[0] != ca || sub->src[1] != fc || mg->src[1] != gate || tg->src[0] != mg || gm->src[0] != tg || gm->src[1] != cb ||
+        add->src[0] != sub || add->src[1] != gm ||
+        ggml_get_unary_op(tf) != GGML_UNARY_OP_TANH || ggml_get_unary_op(tg) != GGML_UNARY_OP_TANH) {
+        return 0;
+    }
+
+    const ggml_tensor * a      = ca->src[0]; // strided [n_embd, n_tokens] views
+    const ggml_tensor * b      = cb->src[0];
+    const ggml_tensor * w_down = gate->src[0];
+    const ggml_tensor * w_f    = mf->src[0];
+    const ggml_tensor * w_g    = mg->src[0];
+
+    const int64_t n  = add->ne[0];
+    const int64_t nt = add->ne[1];
+    const int64_t r  = gate->ne[0];
+    for (const ggml_tensor * v : { a, b }) {
+        if (v->type != GGML_TYPE_F32 || v->nb[0] != sizeof(float) || v->ne[0] != n || v->ne[1] != nt || v->ne[2] != 1 || v->ne[3] != 1 ||
+            v->nb[1] % sizeof(float) != 0) {
+            return 0;
+        }
+    }
+    if (!heph_f32c(w_down) || !heph_f32c(w_f) || !heph_f32c(w_g) || !heph_f32c(gate) || !heph_f32c(cat) || !heph_f32c(add) ||
+        add->ne[2] != 1 || add->ne[3] != 1 || ra->ne[0] != n || ggml_nelements(ra) != n*nt || ggml_nelements(rb) != n*nt ||
+        w_down->ne[0] != 2*n || w_down->ne[1] != r || ggml_nelements(w_down) != 2*n*r ||
+        w_f->ne[0] != r || w_f->ne[1] != n || ggml_nelements(w_f) != n*r || w_g->ne[0] != r || w_g->ne[1] != n || ggml_nelements(w_g) != n*r ||
+        ggml_nelements(gate) != r*nt) {
+        return 0;
+    }
+    ggml_tensor * scratch = nullptr;
+    for (ggml_tensor * cand : { gate, cat, ra, rb }) {
+        if (!heph_overlap(cand, a) && !heph_overlap(cand, b) && !heph_overlap(cand, w_down) && !heph_overlap(cand, w_f) &&
+            !heph_overlap(cand, w_g) && !heph_overlap(cand, add)) {
+            scratch = cand;
+            break;
+        }
+    }
+    // kernel 2 reads cur and msg at strides, so only a dense exact alias is safe
+    const bool dense = a->nb[1] == (size_t) n*sizeof(float) && b->nb[1] == (size_t) n*sizeof(float);
+    if (!scratch || heph_overlap(add, w_f) || heph_overlap(add, w_g) ||
+        (heph_overlap(add, a) && !(dense && add->data == a->data)) || (heph_overlap(add, b) && !(dense && add->data == b->data))) {
+        return 0;
+    }
+    if (!heph_uses_confined(cgraph, i, idx[13])) {
+        return 0;
+    }
+    ggml_cuda_op_loop_control_raw(*cuda_ctx, a, b, ggml_get_op_params_f32(ra, 0), ggml_get_op_params_f32(rb, 0), w_down, w_f, w_g, scratch, add);
+    return idx[13] - i;
+}
+
+// SUM_ROWS SCALE DIV (reshape) SCALE
+static int ggml_cuda_try_fuse_moe_weights_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = heph_fuse_enabled("moew");
+    ggml_tensor * sum = cgraph->nodes[i];
+    if (!enabled || sum->op != GGML_OP_SUM_ROWS) {
+        return 0;
+    }
+    const int i_sc  = heph_next_real(cgraph, i + 1);
+    const int i_div = i_sc  < 0 ? -1 : heph_next_real(cgraph, i_sc + 1);
+    const int i_out = i_div < 0 ? -1 : heph_next_real(cgraph, i_div + 1);
+    if (i_out < 0) {
+        return 0;
+    }
+    ggml_tensor * sc  = cgraph->nodes[i_sc];
+    ggml_tensor * div = cgraph->nodes[i_div];
+    ggml_tensor * out = cgraph->nodes[i_out];
+    const ggml_tensor * w = sum->src[0];
+    if (sc->op != GGML_OP_SCALE || div->op != GGML_OP_DIV || out->op != GGML_OP_SCALE || sc->src[0] != sum ||
+        div->src[0] != w || div->src[1] != sc || heph_strip_views(out->src[0]) != div || ggml_get_op_params_f32(out, 1) != 0.0f) {
+        return 0;
+    }
+    if (!heph_f32c(w) || !heph_f32c(out) || w->ne[2] != 1 || w->ne[3] != 1 || w->ne[0] > 64 || sum->ne[0] != 1 || sum->ne[1] != w->ne[1] ||
+        ggml_nelements(out) != ggml_nelements(w) || !heph_alias_ok(out, w)) {
+        return 0;
+    }
+    if (!heph_uses_confined(cgraph, i, i_out)) {
+        return 0;
+    }
+    ggml_cuda_op_moe_weights_norm(*cuda_ctx, w, out, ggml_get_op_params_f32(sc, 0), ggml_get_op_params_f32(sc, 1), ggml_get_op_params_f32(out, 0));
+    return i_out - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4891,6 +5005,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return n;
         }
         if (const int n = ggml_cuda_try_fuse_mix(cuda_ctx, cgraph, i)) {
+            ++ggml_cuda_heph_fuse_count;
+            return n;
+        }
+        if (const int n = ggml_cuda_try_fuse_loop_control_raw(cuda_ctx, cgraph, i)) {
+            ++ggml_cuda_heph_fuse_count;
+            return n;
+        }
+        if (const int n = ggml_cuda_try_fuse_moe_weights_norm(cuda_ctx, cgraph, i)) {
             ++ggml_cuda_heph_fuse_count;
             return n;
         }

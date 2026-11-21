@@ -29,3 +29,13 @@ void ggml_cuda_op_situ(ggml_backend_cuda_context & ctx, const ggml_tensor * g, c
 // convolve() tail: dst[c, i] = (cur[c, i] + sum_j x[i + j, c]*w[j, c]) * scale
 void ggml_cuda_op_conv_res_scale(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w,
                                  const ggml_tensor * cur, ggml_tensor * dst, float scale);
+
+// control() including the two rms_norm inputs, reading cur and msg as [n_embd, n_tokens] views with a column stride
+void ggml_cuda_op_loop_control_raw(ggml_backend_cuda_context & ctx, const ggml_tensor * cur, const ggml_tensor * msg,
+                                   float eps_cur, float eps_msg,
+                                   const ggml_tensor * w_down, const ggml_tensor * w_forget, const ggml_tensor * w_gain,
+                                   ggml_tensor * gate_tmp, ggml_tensor * dst);
+
+// MoE weight normalisation: dst[k, t] = w[k, t] / (sum_k w[k, t] * s + b) * out_scale
+void ggml_cuda_op_moe_weights_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * w, ggml_tensor * dst,
+                                   float s, float b, float out_scale);
