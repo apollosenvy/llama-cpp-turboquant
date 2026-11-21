@@ -6136,6 +6136,55 @@ static int ggml_cuda_try_fuse_post_proj(ggml_backend_cuda_context * cuda_ctx, gg
     return last - i;
 }
 
+// Attention output: MUL_MAT(rotation) UNARY(sigmoid of the gate) MUL, feeding the output projection.
+// One launch rotates, applies the gate and writes the q8_1 form the projection reads.
+static int ggml_cuda_try_fuse_out_gate(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = heph_fuse_enabled("outgate");
+    ggml_tensor * rotn = cgraph->nodes[i];
+    if (!enabled || rotn->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+    const int i_sig = heph_next_real(cgraph, i + 1);
+    const int i_mul = i_sig < 0 ? -1 : heph_next_real(cgraph, i_sig + 1);
+    if (i_mul < 0) {
+        return 0;
+    }
+    const ggml_tensor * rot = rotn->src[0];
+    const ggml_tensor * x   = rotn->src[1];
+    ggml_tensor *       sig = cgraph->nodes[i_sig];
+    ggml_tensor *       mul = cgraph->nodes[i_mul];
+    if (sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || mul->op != GGML_OP_MUL) {
+        return 0;
+    }
+    const ggml_tensor * gate = sig->src[0];
+    const int64_t n_el = ggml_nelements(rotn);
+    const bool operands = (heph_strip_views(mul->src[0]) == rotn && mul->src[1] == sig) || (heph_strip_views(mul->src[1]) == rotn && mul->src[0] == sig);
+    if (!operands || rot->op != GGML_OP_NONE || !heph_f32c(rot) || rot->ne[0] != 128 || rot->ne[1] != 128 || ggml_nelements(rot) != 128*128 ||
+        !heph_f32c(x) || x->ne[0] != 128 || ggml_nelements(x) != n_el || !heph_f32c(rotn) || rotn->ne[0] != 128 ||
+        !heph_f32c(gate) || ggml_nelements(gate) != n_el || !heph_f32c(mul) || ggml_nelements(mul) != n_el ||
+        ggml_node_get_use_count(cgraph, i) != 1 || ggml_node_get_use_count(cgraph, i_sig) != 1 ||
+        ((rotn->flags | sig->flags) & GGML_TENSOR_FLAG_OUTPUT) ||
+        heph_overlap(mul, rot) || !heph_alias_ok(mul, x) || !heph_alias_ok(mul, gate)) {
+        return 0;
+    }
+    heph_row_jobs jobs = {};
+    jobs.n = 1;
+    heph_row_job & j = jobs.job[0];
+    j.x         = (const float *) x->data;
+    j.rot       = (const float *) rot->data;
+    j.gate      = (const float *) gate->data;
+    j.dst       = (float *) mul->data;
+    j.width     = 128;
+    j.pre       = HEPH_ROT_PRE_NONE;
+    j.block_end = n_el / 128;
+    // a single vector that is a whole number of padded q8_1 rows: hand the projection its quantized input
+    if (ggml_nelements(mul) == mul->ne[0] && n_el % MATRIX_ROW_PADDING == 0) {
+        j.q8 = (void *) ggml_cuda_heph_q8_1(*cuda_ctx, mul, false);
+    }
+    ggml_cuda_op_row_jobs(*cuda_ctx, jobs);
+    return i_mul - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -6147,6 +6196,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (cuda_ctx->stream_context().concurrent_events.empty()) {
         if (const int n = ggml_cuda_try_fuse_post_proj(cuda_ctx, cgraph, i)) {
+            ++ggml_cuda_heph_fuse_count;
+            return n;
+        }
+        if (const int n = ggml_cuda_try_fuse_out_gate(cuda_ctx, cgraph, i)) {
             ++ggml_cuda_heph_fuse_count;
             return n;
         }

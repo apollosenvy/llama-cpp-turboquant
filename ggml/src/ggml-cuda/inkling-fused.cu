@@ -1016,8 +1016,22 @@ static __global__ void row_jobs_f32(const heph_row_jobs jobs) {
             acc += r[u]*s_y[k0 + u];
         }
     }
+    if (j.gate) {
+        acc *= 1.0f / (1.0f + expf(-j.gate[idx]));
+    }
     if (!(j.t3 && j.skip_f32)) {
         j.dst[idx] = acc;
+    }
+    if (j.q8) { // as quantize_q8_1: a warp is one block of 32
+        const float  amax = warp_reduce_max<QK8_1>(fabsf(acc));
+        const float  d    = amax / 127.0f;
+        const int8_t qv   = amax == 0.0f ? 0 : roundf(acc / d);
+        const int    sum  = warp_reduce_sum<QK8_1>((int) qv);
+        block_q8_1 * q    = (block_q8_1 *) j.q8 + idx / QK8_1;
+        q->qs[tid % QK8_1] = qv;
+        if (tid % QK8_1 == 0) {
+            q->ds = make_half2(d, d * sum);
+        }
     }
     if (j.t3 == nullptr) {
         return;

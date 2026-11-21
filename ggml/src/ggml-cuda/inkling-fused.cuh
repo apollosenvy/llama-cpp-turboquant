@@ -103,6 +103,8 @@ struct heph_row_job {
     const float * rot;         // optional [128, 128]
     float *       dst;
     float *       state;       // conv: next state, [3, n_ch] dense
+    const float * gate;        // optional: the result is multiplied by sigmoid(gate), same shape (attention output gate)
+    void *        q8;          // optional: q8_1 form of the F32 result, one block per warp (rows of 128)
     const float * dyn;         // conv: optional input-dependent taps [n_conv*heads, n_t], added to w per head (128 channels)
     const float * post;        // optional factor per token applied after pre (log-scaled position), rows_per_token rows each
     int           dyn_stride;  // taps per token
