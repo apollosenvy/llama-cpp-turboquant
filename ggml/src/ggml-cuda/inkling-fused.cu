@@ -147,3 +147,151 @@ void ggml_cuda_op_mix_states(ggml_backend_cuda_context & ctx, const heph_mix_sta
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(nq, nt, 1), dim3(HEPH_MIX_BLOCK, 1, 1), 0, ctx.stream());
     ggml_cuda_kernel_launch(mix_states_f32, lp, states, n_states, (const float *) query->data, (float *) dst->data, n_embd, nq, eps, sm_scale);
 }
+
+#define HEPH_CTRL_BLOCK 256
+
+// one block per (gate row, token): gate[g, t] = sum_e w_down[e, g] * [a; b][e, t]
+static __global__ void loop_control_gate_f32(const float * a, const float * b, const float * w_down, float * gate,
+                                             const int n_embd, const int rank) {
+    ggml_cuda_pdl_lc();
+    const int g   = blockIdx.x;
+    const int t   = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    const float * wr = w_down + (int64_t) g*2*n_embd;
+    const float * at = a + (int64_t) t*n_embd;
+    const float * bt = b + (int64_t) t*n_embd;
+
+    ggml_cuda_pdl_sync();
+
+    float sum = 0.0f;
+    for (int e = tid; e < n_embd; e += HEPH_CTRL_BLOCK) {
+        sum += wr[e]*at[e] + wr[n_embd + e]*bt[e];
+    }
+    sum = warp_reduce_sum(sum);
+
+    __shared__ float s_sum[HEPH_CTRL_BLOCK / WARP_SIZE];
+    if (tid % WARP_SIZE == 0) {
+        s_sum[tid / WARP_SIZE] = sum;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float total = 0.0f;
+        for (int k = 0; k < HEPH_CTRL_BLOCK / WARP_SIZE; ++k) {
+            total += s_sum[k];
+        }
+        gate[(int64_t) t*rank + g] = total;
+    }
+}
+
+// one thread per output element
+static __global__ void loop_control_apply_f32(const float * gate, const float * w_forget, const float * w_gain,
+                                              const float * cur, const float * msg, float * dst,
+                                              const int n_embd, const int rank, const int64_t n) {
+    ggml_cuda_pdl_lc();
+    const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    const int     e = idx % n_embd;
+    const int64_t t = idx / n_embd;
+
+    const float * gt = gate + t*rank;
+    const float * wf = w_forget + (int64_t) e*rank;
+    const float * wg = w_gain   + (int64_t) e*rank;
+
+    ggml_cuda_pdl_sync();
+
+    float f = 0.0f;
+    float g = 0.0f;
+    for (int k = 0; k < rank; ++k) {
+        f += wf[k]*gt[k];
+        g += wg[k]*gt[k];
+    }
+    const float c = cur[idx];
+    dst[idx] = (c - tanhf(f)*c) + tanhf(g)*msg[idx];
+}
+
+void ggml_cuda_op_loop_control(ggml_backend_cuda_context & ctx, const ggml_tensor * a, const ggml_tensor * b,
+                               const ggml_tensor * w_down, const ggml_tensor * w_forget, const ggml_tensor * w_gain,
+                               const ggml_tensor * cur, const ggml_tensor * msg, ggml_tensor * gate_tmp, ggml_tensor * dst) {
+    const int     n_embd = dst->ne[0];
+    const int     nt     = dst->ne[1];
+    const int     rank   = w_down->ne[1];
+    const int64_t n      = (int64_t) n_embd*nt;
+    cudaStream_t  stream = ctx.stream();
+
+    {
+        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(rank, nt, 1), dim3(HEPH_CTRL_BLOCK, 1, 1), 0, stream);
+        ggml_cuda_kernel_launch(loop_control_gate_f32, lp, (const float *) a->data, (const float *) b->data,
+            (const float *) w_down->data, (float *) gate_tmp->data, n_embd, rank);
+    }
+    {
+        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3((n + 255) / 256, 1, 1), dim3(256, 1, 1), 0, stream);
+        ggml_cuda_kernel_launch(loop_control_apply_f32, lp, (const float *) gate_tmp->data, (const float *) w_forget->data,
+            (const float *) w_gain->data, (const float *) cur->data, (const float *) msg->data, (float *) dst->data, n_embd, rank, n);
+    }
+}
+
+static __global__ void situ_f32(const char * g, const char * u, float * dst, const int n0, const int64_t n,
+                                const int64_t g_nb0, const int64_t g_nb1, const int64_t u_nb0, const int64_t u_nb1,
+                                const float inv_beta, const float beta, const float inv_lb, const float lb) {
+    ggml_cuda_pdl_lc();
+    const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    const int64_t i0 = idx % n0;
+    const int64_t i1 = idx / n0;
+
+    ggml_cuda_pdl_sync();
+
+    const float gv = *(const float *) (g + i0*g_nb0 + i1*g_nb1);
+    const float uv = *(const float *) (u + i0*u_nb0 + i1*u_nb1);
+
+    // same association as the unfused chain: ((tanh(g/beta)*beta) * sigmoid(g)) * (tanh(u/lb)*lb)
+    const float act = (tanhf(gv*inv_beta)*beta) * (1.0f / (1.0f + expf(-gv)));
+    dst[idx] = act * (tanhf(uv*inv_lb)*lb);
+}
+
+void ggml_cuda_op_situ(ggml_backend_cuda_context & ctx, const ggml_tensor * g, const ggml_tensor * u, ggml_tensor * dst,
+                       float inv_beta, float beta, float inv_lb, float lb) {
+    const int64_t n  = ggml_nelements(dst);
+    const int     n0 = dst->ne[0];
+    // rows beyond ne[1] fold into the nb[1] stride only when the higher dims are contiguous in nb[1] steps
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3((n + 255) / 256, 1, 1), dim3(256, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(situ_f32, lp, (const char *) g->data, (const char *) u->data, (float *) dst->data, n0, n,
+        (int64_t) g->nb[0], (int64_t) g->nb[1], (int64_t) u->nb[0], (int64_t) u->nb[1], inv_beta, beta, inv_lb, lb);
+}
+
+static __global__ void conv_res_scale_f32(const float * x, const float * w, const float * cur, float * dst,
+                                          const int n_ch, const int n_conv, const int x_len, const int64_t n, const float scale) {
+    ggml_cuda_pdl_lc();
+    const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    const int     c = idx % n_ch;
+    const int64_t i = idx / n_ch;
+
+    ggml_cuda_pdl_sync();
+
+    const float * xc = x + (int64_t) c*x_len + i;
+    const float * wc = w + (int64_t) c*n_conv;
+    float sum = 0.0f;
+    for (int j = 0; j < n_conv; ++j) {
+        sum += xc[j]*wc[j];
+    }
+    dst[idx] = (cur[idx] + sum)*scale;
+}
+
+void ggml_cuda_op_conv_res_scale(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w,
+                                 const ggml_tensor * cur, ggml_tensor * dst, float scale) {
+    const int     n_ch   = w->ne[1];
+    const int     n_conv = w->ne[0];
+    const int     x_len  = x->ne[0];
+    const int64_t n      = ggml_nelements(dst);
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3((n + 255) / 256, 1, 1), dim3(256, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(conv_res_scale_f32, lp, (const float *) x->data, (const float *) w->data, (const float *) cur->data,
+        (float *) dst->data, n_ch, n_conv, x_len, n, scale);
+}
