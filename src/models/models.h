@@ -2537,6 +2537,9 @@ struct llama_model_inkling2 : public llama_model_base {
 
         ggml_tensor * inp_out_ids = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
+
+        // one biased attention mask buffer per cache (full, SWA), written by every layer of that kind in turn
+        ggml_tensor * rel_mask[2] = { nullptr, nullptr };
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

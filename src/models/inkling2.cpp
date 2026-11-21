@@ -370,10 +370,17 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         ggml_tensor * kq_b;
         if (cparams.flash_attn && n_stream == 1 && mask_raw->type == GGML_TYPE_F16 && mask_raw->ne[1] == n_tokens &&
             ggml_nelements(mask_raw) == n_kv*n_tokens && ggml_nelements(rel_pos) == n_kv*n_tokens) {
-            // one op gives the biased mask of every head in F16, the only n_kv x n_tokens x n_head tensor of the layer.
+            // One op gives the biased mask of every head in F16, the only n_kv x n_tokens x n_head tensor of the layer.
             // The chain below holds two F32 tensors of that size at once, which caps the batch at long context.
-            kq_b = ggml_rel_bias_mask(ctx0, layer.attn_rel_bias, Rcur, sinks,
-                    ggml_reshape_2d(ctx0, rel_pos, n_kv, n_tokens), ggml_reshape_2d(ctx0, mask_raw, n_kv, n_tokens));
+            // Every layer of a kind writes the same buffer: a result of its own per layer gets a second copy reserved,
+            // because small tensors split the slot the previous layer freed.
+            ggml_tensor *& buf = rel_mask[is_swa ? 1 : 0];
+            if (buf == nullptr) {
+                buf = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, n_kv, n_tokens, n_head);
+            }
+            GGML_ASSERT(buf->ne[0] == n_kv && buf->ne[2] == n_head);
+            // rel_pos and the mask go in as they are: a reshaped view per layer makes the scheduler copy the input per layer
+            kq_b = ggml_rel_bias_mask(ctx0, layer.attn_rel_bias, Rcur, sinks, rel_pos, mask_raw, buf);
         } else {
             // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
             ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);

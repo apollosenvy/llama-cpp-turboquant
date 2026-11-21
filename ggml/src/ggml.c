@@ -6201,7 +6201,8 @@ struct ggml_tensor * ggml_rel_bias_mask(
         struct ggml_tensor  * r,
         struct ggml_tensor  * sinks,
         struct ggml_tensor  * rel_pos,
-        struct ggml_tensor  * mask) {
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * dst) {
     const int64_t n_rel    = bias->ne[0];
     const int64_t n_head   = r->ne[1];
     const int64_t n_tokens = r->ne[2];
@@ -6213,7 +6214,14 @@ struct ggml_tensor * ggml_rel_bias_mask(
     GGML_ASSERT(rel_pos->type == GGML_TYPE_I32 && rel_pos->ne[1] == n_tokens && ggml_nelements(rel_pos) == n_kv*n_tokens);
     GGML_ASSERT(mask->type == GGML_TYPE_F16 && mask->ne[0] == n_kv && mask->ne[1] == n_tokens && ggml_nelements(mask) == n_kv*n_tokens);
 
-    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_kv, n_tokens, n_head);
+    struct ggml_tensor * result;
+    if (dst) {
+        GGML_ASSERT(dst->type == GGML_TYPE_F16 && ggml_is_contiguous(dst) && dst->ne[0] == n_kv && dst->ne[1] == n_tokens &&
+                    dst->ne[2] == n_head && dst->ne[3] == 1);
+        result = ggml_view_tensor(ctx, dst);
+    } else {
+        result = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_kv, n_tokens, n_head);
+    }
 
     result->op     = GGML_OP_REL_BIAS_MASK;
     result->src[0] = bias;
@@ -6221,6 +6229,7 @@ struct ggml_tensor * ggml_rel_bias_mask(
     result->src[2] = sinks;
     result->src[3] = rel_pos;
     result->src[4] = mask;
+    result->src[5] = dst;
 
     return result;
 }

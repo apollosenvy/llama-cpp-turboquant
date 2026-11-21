@@ -2307,13 +2307,15 @@ extern "C" {
     // rel_pos [n_kv, n_tokens]          I32
     // mask    [n_kv, n_tokens]          F16
     // result  [n_kv, n_tokens, n_head]  F16
+    // dst: optional tensor of the result shape to write into, the result is then a view of it (as with ggml_cpy)
     GGML_API struct ggml_tensor * ggml_rel_bias_mask(
             struct ggml_context * ctx,
             struct ggml_tensor  * bias,
             struct ggml_tensor  * r,
             struct ggml_tensor  * sinks,
             struct ggml_tensor  * rel_pos,
-            struct ggml_tensor  * mask);
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * dst);
 
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
