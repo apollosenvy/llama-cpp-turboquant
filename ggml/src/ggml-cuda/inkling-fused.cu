@@ -1100,3 +1100,60 @@ void ggml_cuda_op_row_jobs(ggml_backend_cuda_context & ctx, const heph_row_jobs 
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(blocks, 1, 1), dim3(128, 1, 1), 0, ctx.stream());
     ggml_cuda_kernel_launch(row_jobs_f32, lp, jobs);
 }
+
+#define HEPH_ROUTE_BLOCK 128
+#define HEPH_ROUTE_MAX_USED 16
+// one block per token, one thread per expert: every thread ranks its own score against the others from shared memory
+static __global__ void moe_route_f32(const float * logits, const float * bias, int32_t * ids, float * w_out,
+                                     const int n_expert, const int n_used, const int64_t ids_stride,
+                                     const float s, const float b, const float out_scale) {
+    ggml_cuda_pdl_lc();
+    const int64_t t   = blockIdx.x;
+    const int     tid = threadIdx.x;
+
+    __shared__ float s_sel[HEPH_ROUTE_BLOCK];
+    __shared__ float s_w[HEPH_ROUTE_MAX_USED];
+
+    ggml_cuda_pdl_sync();
+
+    float p   = 0.0f;
+    float sel = -INFINITY;
+    if (tid < n_expert) {
+        p   = 1.0f / (1.0f + expf(-logits[t*n_expert + tid]));
+        sel = bias ? p + bias[tid] : p;
+    }
+    s_sel[tid] = sel;
+    __syncthreads();
+
+    int rank = 0;
+    for (int j0 = 0; j0 < HEPH_ROUTE_BLOCK; j0 += 16) {
+#pragma unroll
+        for (int u = 0; u < 16; ++u) {
+            const int   j     = j0 + u;
+            const float other = s_sel[j];
+            rank += (other > sel) || (other == sel && j < tid);
+        }
+    }
+    if (tid < n_expert && rank < n_used) {
+        ids[t*ids_stride + rank] = tid;
+        s_w[rank] = p;
+    }
+    __syncthreads();
+    if (tid < n_used) {
+        float sum = 0.0f;
+        for (int k = 0; k < n_used; ++k) {
+            sum += s_w[k];
+        }
+        w_out[t*n_used + tid] = s_w[tid] / (sum*s + b) * out_scale;
+    }
+}
+
+void ggml_cuda_op_moe_route(ggml_backend_cuda_context & ctx, const ggml_tensor * logits, const ggml_tensor * bias,
+                            void * ids, int64_t ids_stride, ggml_tensor * weights, int n_used, float s, float b, float out_scale) {
+    const int     n_expert = logits->ne[0];
+    const int64_t n_tokens = ggml_nelements(logits) / n_expert;
+    GGML_ASSERT(n_expert <= HEPH_ROUTE_BLOCK && n_used <= HEPH_ROUTE_MAX_USED && n_used <= n_expert);
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(n_tokens, 1, 1), dim3(HEPH_ROUTE_BLOCK, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(moe_route_f32, lp, (const float *) logits->data, bias ? (const float *) bias->data : nullptr,
+        (int32_t *) ids, (float *) weights->data, n_expert, n_used, ids_stride, s, b, out_scale);
+}

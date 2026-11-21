@@ -161,3 +161,9 @@ struct heph_normq_jobs {
     int           n;
 };
 void ggml_cuda_op_rms_norm_mul_q8_jobs(ggml_backend_cuda_context & ctx, const heph_normq_jobs & jobs, int n);
+
+// MoE router for sigmoid gating with a selection bias: the n_used experts with the largest sigmoid(logit) + bias, in
+// descending order, and their normalised weights w/(sum(w)*s + b)*out_scale with w = sigmoid(logit).
+// logits [n_expert <= 128, n_tokens], ids written as int32 with ids_stride per token, weights [n_used, n_tokens].
+void ggml_cuda_op_moe_route(ggml_backend_cuda_context & ctx, const ggml_tensor * logits, const ggml_tensor * bias,
+                            void * ids, int64_t ids_stride, ggml_tensor * weights, int n_used, float s, float b, float out_scale);

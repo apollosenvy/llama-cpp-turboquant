@@ -6185,6 +6185,65 @@ static int ggml_cuda_try_fuse_out_gate(ggml_backend_cuda_context * cuda_ctx, ggm
     return i_mul - i;
 }
 
+// MoE router with sigmoid gating: SIGMOID ADD(bias) ARGSORT(desc) [top-k view] GET_ROWS, then the weight normalisation
+// SUM_ROWS SCALE DIV SCALE. One kernel writes the expert ids and the final weights.
+static int ggml_cuda_try_fuse_moe_route(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = heph_fuse_enabled("route");
+    ggml_tensor * sig = cgraph->nodes[i];
+    if (!enabled || sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID) {
+        return 0;
+    }
+    int idx[8] = { i };
+    static const enum ggml_op ops[8] = { GGML_OP_UNARY, GGML_OP_ADD, GGML_OP_ARGSORT, GGML_OP_GET_ROWS,
+                                         GGML_OP_SUM_ROWS, GGML_OP_SCALE, GGML_OP_DIV, GGML_OP_SCALE };
+    for (int k = 1; k < 8; ++k) {
+        idx[k] = heph_next_real(cgraph, idx[k - 1] + 1);
+        if (idx[k] < 0 || cgraph->nodes[idx[k]]->op != ops[k]) {
+            return 0;
+        }
+    }
+    ggml_tensor * add  = cgraph->nodes[idx[1]];
+    ggml_tensor * arg  = cgraph->nodes[idx[2]];
+    ggml_tensor * rows = cgraph->nodes[idx[3]];
+    ggml_tensor * sum  = cgraph->nodes[idx[4]];
+    ggml_tensor * sc1  = cgraph->nodes[idx[5]];
+    ggml_tensor * div  = cgraph->nodes[idx[6]];
+    ggml_tensor * out  = cgraph->nodes[idx[7]];
+
+    const ggml_tensor * logits = sig->src[0];
+    const ggml_tensor * bias   = add->src[0] == sig ? add->src[1] : add->src[1] == sig ? add->src[0] : nullptr;
+    const ggml_tensor * ids    = rows->src[1];
+    const int64_t n_expert = logits->ne[0];
+    const int64_t n_tokens = ggml_nelements(logits) / n_expert;
+    const int64_t n_used   = ids->ne[0];
+    if (bias == nullptr || bias == sig || !heph_f32c(bias) || ggml_nelements(bias) != n_expert || bias->op != GGML_OP_NONE ||
+        !heph_f32c(logits) || n_expert > 128 || n_used < 1 || n_used > 16 || n_used > n_expert ||
+        arg->src[0] != add || ggml_get_op_params_i32(arg, 0) != GGML_SORT_ORDER_DESC || arg->type != GGML_TYPE_I32 ||
+        !ggml_is_contiguous(arg) || arg->ne[0] != n_expert || ggml_nelements(arg) != n_expert*n_tokens ||
+        ids->view_src != arg || ids->data != arg->data || ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t) ||
+        ggml_nelements(ids) != n_used*n_tokens || (n_tokens > 1 && ids->nb[1] != arg->nb[1]) ||
+        heph_strip_views(rows->src[0]) != sig || rows->src[0]->ne[0] != 1 ||
+        heph_strip_views(sum->src[0]) != rows || sc1->src[0] != sum || heph_strip_views(div->src[0]) != rows || div->src[1] != sc1 ||
+        heph_strip_views(out->src[0]) != div || ggml_get_op_params_f32(out, 1) != 0.0f ||
+        !heph_f32c(out) || ggml_nelements(out) != n_used*n_tokens) {
+        return 0;
+    }
+    // nothing in between may have a reader outside the chain, except the ids (through their view) and the final weights
+    const int single_use[5] = { idx[1], idx[2], idx[4], idx[5], idx[6] };
+    for (int k : single_use) {
+        if (ggml_node_get_use_count(cgraph, k) != 1 || (cgraph->nodes[k]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+    }
+    if (ggml_node_get_use_count(cgraph, i) != 2 || ((sig->flags | rows->flags) & GGML_TENSOR_FLAG_OUTPUT) ||
+        heph_overlap(out, logits) || heph_overlap(arg, logits) || heph_overlap(out, bias) || heph_overlap(arg, bias) || heph_overlap(out, arg)) {
+        return 0;
+    }
+    ggml_cuda_op_moe_route(*cuda_ctx, logits, bias, arg->data, arg->nb[1] / sizeof(int32_t), out, n_used,
+        ggml_get_op_params_f32(sc1, 0), ggml_get_op_params_f32(sc1, 1), ggml_get_op_params_f32(out, 0));
+    return idx[7] - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -6196,6 +6255,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (cuda_ctx->stream_context().concurrent_events.empty()) {
         if (const int n = ggml_cuda_try_fuse_post_proj(cuda_ctx, cgraph, i)) {
+            ++ggml_cuda_heph_fuse_count;
+            return n;
+        }
+        if (const int n = ggml_cuda_try_fuse_moe_route(cuda_ctx, cgraph, i)) {
             ++ggml_cuda_heph_fuse_count;
             return n;
         }
