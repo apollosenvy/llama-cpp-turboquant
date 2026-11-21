@@ -683,7 +683,8 @@ void ggml_cuda_op_conv_concat_store(ggml_backend_cuda_context & ctx, const ggml_
 // dst[c, t] = (cur[c, t] + sum_j x4[t + j, c]*w[j, c])*scale [+ res[c, t]], state[c, j] = x4[n_t + j, c]
 template <int n_conv>
 static __global__ void conv_full_f32(const float * past, const int64_t past_stride, const float * cur, const float * w, const float * res,
-                                     float * dst, float * state, const int n_t, const int n_ch, const int64_t n, const float scale) {
+                                     float * dst, float * state, const int n_t, const int n_ch, const int64_t n, const float scale,
+                                     const float * ws_x, const float * ws_w, const int ws_n) {
     ggml_cuda_pdl_lc();
     const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
     if (idx >= n) {
@@ -700,8 +701,27 @@ static __global__ void conv_full_f32(const float * past, const int64_t past_stri
 #pragma unroll
     for (int j = 0; j < n_conv; ++j) {
         const int i = t + j;
-        v[j]  = i < n_past ? past[(int64_t) c*past_stride + i] : cur[(int64_t) (i - n_past)*n_ch + c];
         wv[j] = w[(int64_t) c*n_conv + j];
+        if (i < n_past) {
+            v[j] = past[(int64_t) c*past_stride + i];
+        } else if (ws_x == nullptr) {
+            v[j] = cur[(int64_t) (i - n_past)*n_ch + c];
+        } else {
+            // single token: cur is the weighted sum of the expert outputs, sum_k ws_w[k]*ws_x[c, k]
+            float xe[8];
+            float we[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                xe[k] = k < ws_n ? ws_x[(int64_t) k*n_ch + c] : 0.0f;
+                we[k] = k < ws_n ? ws_w[k] : 0.0f;
+            }
+            float acc = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                acc += xe[k]*we[k];
+            }
+            v[j] = acc;
+        }
     }
     float sum = 0.0f;
 #pragma unroll
@@ -719,15 +739,18 @@ static __global__ void conv_full_f32(const float * past, const int64_t past_stri
 }
 
 void ggml_cuda_op_conv_full(ggml_backend_cuda_context & ctx, const ggml_tensor * past, const ggml_tensor * cur, const ggml_tensor * w,
-                            const ggml_tensor * res, ggml_tensor * dst, void * state, float scale) {
+                            const ggml_tensor * res, ggml_tensor * dst, void * state, float scale,
+                            const ggml_tensor * ws_x, const ggml_tensor * ws_w) {
     GGML_ASSERT(w->ne[0] == 4);
+    GGML_ASSERT(ws_x == nullptr || (ws_w != nullptr && ws_x->ne[1] <= 8 && ggml_nelements(dst) == w->ne[1]));
     const int     n_ch = w->ne[1];
     const int64_t n    = ggml_nelements(dst);
     const int     n_t  = n / n_ch;
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3((n + 255) / 256, 1, 1), dim3(256, 1, 1), 0, ctx.stream());
     ggml_cuda_kernel_launch(conv_full_f32<4>, lp, (const float *) past->data, (int64_t) (past->nb[1] / sizeof(float)),
         (const float *) cur->data, (const float *) w->data, res ? (const float *) res->data : nullptr, (float *) dst->data, (float *) state,
-        n_t, n_ch, n, scale);
+        n_t, n_ch, n, scale, ws_x ? (const float *) ws_x->data : nullptr, ws_w ? (const float *) ws_w->data : nullptr,
+        ws_x ? (int) ws_x->ne[1] : 0);
 }
 
 // Row transform + dense rotation, one block per row of n_rot elements:

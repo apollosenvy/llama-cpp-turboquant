@@ -5404,7 +5404,10 @@ static int ggml_cuda_try_skip_rel_pad(ggml_backend_cuda_context * cuda_ctx, ggml
 // convolve(): CONCAT(past, x) CPY(state store) [SSM_CONV ADD SCALE]
 // With the conv tail right behind, the whole thing is one kernel and the concat buffer is never written.
 // Otherwise (K and V, whose tails come later) the concat and the state store share one kernel.
-static int ggml_cuda_try_fuse_conv_state(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+// ws: the conv input is the MoE weighted sum matched just before (single token): only the whole-convolve form applies,
+// and the kernel computes that sum itself instead of reading cur
+static int heph_conv_state_impl(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i,
+                                const ggml_cuda_moe_weighted_reduction_match * ws) {
     static const bool enabled = heph_fuse_enabled("convst");
     ggml_tensor * cat = cgraph->nodes[i];
     if (!enabled || cat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cat, 0) != 0) {
@@ -5478,10 +5481,21 @@ static int ggml_cuda_try_fuse_conv_state(ggml_backend_cuda_context * cuda_ctx, g
                 !heph_overlap(dst, past) && !heph_overlap(dst, w) && !heph_overlap(dst, cpy) && !heph_overlap(cpy, w) &&
                 (!res || !heph_overlap(cpy, res)) &&
                 (n_t == 1 ? heph_alias_ok(dst, cur) : !heph_overlap(dst, cur))) {
-                ggml_cuda_op_conv_full(*cuda_ctx, past, cur, w, res, dst, cpy->data, ggml_get_op_params_f32(sc, 0));
-                return last - i;
+                if (ws == nullptr) {
+                    ggml_cuda_op_conv_full(*cuda_ctx, past, cur, w, res, dst, cpy->data, ggml_get_op_params_f32(sc, 0));
+                    return last - i;
+                }
+                // a thread reads its channel of every expert before it writes that channel
+                if (n_t == 1 && cur == ws->dst && heph_alias_ok(dst, ws->experts) && !heph_overlap(dst, ws->weights) &&
+                    !heph_overlap(cpy, ws->experts) && !heph_overlap(cpy, ws->weights)) {
+                    ggml_cuda_op_conv_full(*cuda_ctx, past, cur, w, res, dst, cpy->data, ggml_get_op_params_f32(sc, 0), ws->experts, ws->weights);
+                    return last - i;
+                }
             }
         }
+    }
+    if (ws != nullptr) {
+        return 0;
     }
 
     if (heph_overlap(cat, past) || heph_overlap(cat, cur)) {
@@ -5489,6 +5503,42 @@ static int ggml_cuda_try_fuse_conv_state(ggml_backend_cuda_context * cuda_ctx, g
     }
     ggml_cuda_op_conv_concat_store(*cuda_ctx, past, cur, cat, cpy->data, n_t);
     return i_cpy - i;
+}
+
+static int ggml_cuda_try_fuse_conv_state(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    return heph_conv_state_impl(cuda_ctx, cgraph, i, nullptr);
+}
+
+// MoE weighted sum of the expert outputs, then the whole convolve() and the layer's residual add: one kernel (single token)
+static int ggml_cuda_try_fuse_ffn_tail(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = heph_fuse_enabled("ffntail");
+    if (!enabled || cgraph->nodes[i]->op != GGML_OP_MUL) {
+        return 0;
+    }
+    ggml_cuda_moe_weighted_reduction_match ws;
+    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, i, ws) || ws.expert_scale != nullptr || ws.experts->ne[1] > 8 ||
+        ws.experts->ne[2]*ws.experts->ne[3] != 1 || ggml_nelements(ws.weights) != ws.experts->ne[1]) {
+        return 0;
+    }
+    // the sum is read by the conv chain only: once through the transposed view the concat takes, once by the conv's own add
+    const int i_sum = i + ws.node_count - 1;
+    if (cgraph->nodes[i_sum] != ws.dst || ggml_node_get_use_count(cgraph, i_sum) != 2 || (ws.dst->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    for (int k = i; k < i_sum; ++k) { // the products and partial sums in between have no reader outside the reduction
+        if (cgraph->nodes[k]->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return 0;
+        }
+    }
+    if (!heph_uses_confined(cgraph, i, i_sum)) {
+        return 0;
+    }
+    const int i_cat = heph_next_real(cgraph, i_sum + 1);
+    if (i_cat < 0) {
+        return 0;
+    }
+    const int n = heph_conv_state_impl(cuda_ctx, cgraph, i_cat, &ws);
+    return n > 0 ? i_cat - i + n : 0;
 }
 
 // [SSM_CONV ADD SCALE] -> [clip chain | RMS_NORM] -> MUL_MAT with a dense 128x128 weight: one block per row.
@@ -6255,6 +6305,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (cuda_ctx->stream_context().concurrent_events.empty()) {
         if (const int n = ggml_cuda_try_fuse_post_proj(cuda_ctx, cgraph, i)) {
+            ++ggml_cuda_heph_fuse_count;
+            return n;
+        }
+        if (const int n = ggml_cuda_try_fuse_ffn_tail(cuda_ctx, cgraph, i)) {
             ++ggml_cuda_heph_fuse_count;
             return n;
         }

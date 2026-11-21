@@ -52,8 +52,10 @@ void ggml_cuda_op_conv_concat_store(ggml_backend_cuda_context & ctx, const ggml_
 
 // whole convolve() without dynamic taps (n_conv == 4): state store, convolution, residual and scale in one kernel
 // res: optional residual stream added to the result (the layer's residual add that follows convolve())
+// ws_x, ws_w: optional, single token only: cur is not read, it is sum_k ws_w[k]*ws_x[:, k] (the MoE weighted sum, <= 8 experts)
 void ggml_cuda_op_conv_full(ggml_backend_cuda_context & ctx, const ggml_tensor * past, const ggml_tensor * cur, const ggml_tensor * w,
-                            const ggml_tensor * res, ggml_tensor * dst, void * state, float scale);
+                            const ggml_tensor * res, ggml_tensor * dst, void * state, float scale,
+                            const ggml_tensor * ws_x = nullptr, const ggml_tensor * ws_w = nullptr);
 
 #define HEPH_ROT_PRE_NONE 0
 #define HEPH_ROT_PRE_CLIP 1
