@@ -595,3 +595,83 @@ void ggml_cuda_op_rel_bias_mask(ggml_backend_cuda_context & ctx, const ggml_tens
         CUDA_CHECK(cudaMemcpyAsync(dst->data, scratch, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, ctx.stream()));
     }
 }
+
+// convolve() head: x4[i, c] = i < n_past ? past[i, c] : cur[c, i - n_past]; writes the concat buffer and the next state
+static __global__ void conv_concat_store_f32(const float * past, const int64_t past_stride, const float * cur, float * cat, float * state,
+                                             const int n_past, const int n_t, const int n_ch, const int64_t n) {
+    ggml_cuda_pdl_lc();
+    const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    const int len = n_past + n_t;
+    const int i   = idx % len;
+    const int c   = idx / len;
+
+    ggml_cuda_pdl_sync();
+
+    const float v = i < n_past ? past[(int64_t) c*past_stride + i] : cur[(int64_t) (i - n_past)*n_ch + c];
+    cat[idx] = v;
+    if (i >= n_t) {
+        state[(int64_t) c*n_past + (i - n_t)] = v;
+    }
+}
+
+void ggml_cuda_op_conv_concat_store(ggml_backend_cuda_context & ctx, const ggml_tensor * past, const ggml_tensor * cur,
+                                    ggml_tensor * cat, void * state, int n_t) {
+    const int     n_past = past->ne[0];
+    const int     n_ch   = past->ne[1];
+    const int64_t n      = (int64_t) (n_past + n_t)*n_ch;
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3((n + 255) / 256, 1, 1), dim3(256, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(conv_concat_store_f32, lp, (const float *) past->data, (int64_t) (past->nb[1] / sizeof(float)),
+        (const float *) cur->data, (float *) cat->data, (float *) state, n_past, n_t, n_ch, n);
+}
+
+// whole convolve() without dynamic taps, the concat buffer is never materialised:
+// dst[c, t] = (cur[c, t] + sum_j x4[t + j, c]*w[j, c])*scale, state[c, j] = x4[n_t + j, c]
+template <int n_conv>
+static __global__ void conv_full_f32(const float * past, const int64_t past_stride, const float * cur, const float * w, float * dst,
+                                     float * state, const int n_t, const int n_ch, const int64_t n, const float scale) {
+    ggml_cuda_pdl_lc();
+    const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    constexpr int n_past = n_conv - 1;
+    const int c = idx % n_ch;
+    const int t = idx / n_ch;
+
+    ggml_cuda_pdl_sync();
+
+    float v[n_conv];
+    float wv[n_conv];
+#pragma unroll
+    for (int j = 0; j < n_conv; ++j) {
+        const int i = t + j;
+        v[j]  = i < n_past ? past[(int64_t) c*past_stride + i] : cur[(int64_t) (i - n_past)*n_ch + c];
+        wv[j] = w[(int64_t) c*n_conv + j];
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (int j = 0; j < n_conv; ++j) {
+        sum += v[j]*wv[j];
+    }
+    dst[idx] = (v[n_past] + sum)*scale; // v[n_past] is cur[c, t]
+    if (t == n_t - 1) {
+#pragma unroll
+        for (int j = 0; j < n_past; ++j) {
+            state[(int64_t) c*n_past + j] = v[j + 1];
+        }
+    }
+}
+
+void ggml_cuda_op_conv_full(ggml_backend_cuda_context & ctx, const ggml_tensor * past, const ggml_tensor * cur, const ggml_tensor * w,
+                            ggml_tensor * dst, void * state, float scale) {
+    GGML_ASSERT(w->ne[0] == 4);
+    const int     n_ch = w->ne[1];
+    const int64_t n    = ggml_nelements(dst);
+    const int     n_t  = n / n_ch;
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3((n + 255) / 256, 1, 1), dim3(256, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(conv_full_f32<4>, lp, (const float *) past->data, (int64_t) (past->nb[1] / sizeof(float)),
+        (const float *) cur->data, (const float *) w->data, (float *) dst->data, (float *) state, n_t, n_ch, n, scale);
+}

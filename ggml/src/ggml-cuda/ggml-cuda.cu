@@ -5091,6 +5091,79 @@ static int ggml_cuda_try_fuse_rel_bias_mask(ggml_backend_cuda_context * cuda_ctx
     return idx[8] - i;
 }
 
+// convolve(): CONCAT(past, x) CPY(state store) [SSM_CONV ADD SCALE]
+// With the conv tail right behind, the whole thing is one kernel and the concat buffer is never written.
+// Otherwise (K and V, whose tails come later) the concat and the state store share one kernel.
+static int ggml_cuda_try_fuse_conv_state(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = heph_fuse_enabled("convst");
+    ggml_tensor * cat = cgraph->nodes[i];
+    if (!enabled || cat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cat, 0) != 0) {
+        return 0;
+    }
+    const int i_cpy = heph_next_real(cgraph, i + 1);
+    if (i_cpy < 0 || cgraph->nodes[i_cpy]->op != GGML_OP_CPY) {
+        return 0;
+    }
+    ggml_tensor *       cpy  = cgraph->nodes[i_cpy];
+    const ggml_tensor * past = cat->src[0];
+    const ggml_tensor * cur  = heph_strip_views(cat->src[1]);
+    const ggml_tensor * last = cpy->src[0];
+    const ggml_tensor * cell = cpy->src[1];
+
+    const int64_t n_past = past->ne[0];
+    const int64_t n_ch   = past->ne[1];
+    const int64_t n_t    = cat->ne[0] - n_past;
+    // x must be the transposed [n_ch, n_t] cur, one sequence
+    if (past->type != GGML_TYPE_F32 || past->ne[2] != 1 || past->ne[3] != 1 || past->nb[0] != sizeof(float) ||
+        !heph_f32c(cur) || !heph_f32c(cat) || n_t < 1 || cat->ne[1] != n_ch || cat->ne[2] != 1 || cat->ne[3] != 1 ||
+        cur->ne[0] != n_ch || ggml_nelements(cur) != n_ch*n_t ||
+        cat->src[1]->ne[0] != n_t || cat->src[1]->ne[1] != n_ch || cat->src[1]->data != cur->data ||
+        cat->src[1]->nb[0] != (size_t) n_ch*sizeof(float) || cat->src[1]->nb[1] != sizeof(float)) {
+        return 0;
+    }
+    // the store copies the last n_past columns of the concat into the cell of the one sequence (a single row, so it is dense)
+    if (last->view_src != cat || (const char *) last->data != (const char *) cat->data + n_t*sizeof(float) ||
+        last->ne[0] != n_past || last->ne[1] != n_ch || last->ne[2] != 1 || last->ne[3] != 1 ||
+        last->nb[0] != sizeof(float) || last->nb[1] != cat->nb[1] ||
+        cell->type != GGML_TYPE_F32 || cell->nb[0] != sizeof(float) || cell->ne[0] != n_past*n_ch || ggml_nelements(cell) != n_past*n_ch ||
+        cpy->data != cell->data) {
+        return 0;
+    }
+    if (heph_overlap(cpy, past) || heph_overlap(cpy, cur) || heph_overlap(cpy, cat)) {
+        return 0;
+    }
+
+    // full form: the conv tail follows directly
+    const int i_conv = heph_next_real(cgraph, i_cpy + 1);
+    if (i_conv >= 0 && cgraph->nodes[i_conv]->op == GGML_OP_SSM_CONV && cgraph->nodes[i_conv]->src[0] == cat) {
+        ggml_tensor * conv  = cgraph->nodes[i_conv];
+        const int     i_add = heph_next_real(cgraph, i_conv + 1);
+        const int     i_sc  = i_add < 0 ? -1 : heph_next_real(cgraph, i_add + 1);
+        if (i_sc >= 0) {
+            ggml_tensor *       add = cgraph->nodes[i_add];
+            ggml_tensor *       sc  = cgraph->nodes[i_sc];
+            const ggml_tensor * w   = conv->src[1];
+            const bool tail = add->op == GGML_OP_ADD && sc->op == GGML_OP_SCALE && sc->src[0] == add &&
+                ggml_get_op_params_f32(sc, 1) == 0.0f && heph_strip_views(add->src[1]) == conv && add->src[0] == cur;
+            if (tail && n_past == 3 && heph_f32c(w) && w->ne[0] == 4 && w->ne[1] == n_ch && ggml_nelements(w) == 4*n_ch &&
+                heph_f32c(sc) && sc->ne[0] == n_ch && ggml_nelements(sc) == n_ch*n_t &&
+                !(cat->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(cgraph, i) == 2 &&
+                heph_uses_confined(cgraph, i_conv, i_sc) &&
+                !heph_overlap(sc, past) && !heph_overlap(sc, w) && !heph_overlap(sc, cpy) && !heph_overlap(cpy, w) &&
+                (n_t == 1 ? heph_alias_ok(sc, cur) : !heph_overlap(sc, cur))) {
+                ggml_cuda_op_conv_full(*cuda_ctx, past, cur, w, sc, cpy->data, ggml_get_op_params_f32(sc, 0));
+                return i_sc - i;
+            }
+        }
+    }
+
+    if (heph_overlap(cat, past) || heph_overlap(cat, cur)) {
+        return 0;
+    }
+    ggml_cuda_op_conv_concat_store(*cuda_ctx, past, cur, cat, cpy->data, n_t);
+    return i_cpy - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -5101,6 +5174,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     ggml_tensor * node = cgraph->nodes[i];
 
     if (cuda_ctx->stream_context().concurrent_events.empty()) {
+        if (const int n = ggml_cuda_try_fuse_conv_state(cuda_ctx, cgraph, i)) {
+            ++ggml_cuda_heph_fuse_count;
+            return n;
+        }
         if (const int n = ggml_cuda_try_fuse_clip_rows(cuda_ctx, cgraph, i)) {
             ++ggml_cuda_heph_fuse_count;
             return n;

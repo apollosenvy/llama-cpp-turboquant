@@ -45,3 +45,11 @@ void ggml_cuda_op_moe_weights_norm(ggml_backend_cuda_context & ctx, const ggml_t
 void ggml_cuda_op_rel_bias_mask(ggml_backend_cuda_context & ctx, const ggml_tensor * bias, const void * r,
                                 const ggml_tensor * sinks, const ggml_tensor * rel_pos, const ggml_tensor * mask, ggml_tensor * dst,
                                 void * scratch);
+
+// convolve() head: concat of the recurrent past with the new columns, plus the state store
+void ggml_cuda_op_conv_concat_store(ggml_backend_cuda_context & ctx, const ggml_tensor * past, const ggml_tensor * cur,
+                                    ggml_tensor * cat, void * state, int n_t);
+
+// whole convolve() without dynamic taps (n_conv == 4): state store, convolution, residual and scale in one kernel
+void ggml_cuda_op_conv_full(ggml_backend_cuda_context & ctx, const ggml_tensor * past, const ggml_tensor * cur, const ggml_tensor * w,
+                            ggml_tensor * dst, void * state, float scale);
