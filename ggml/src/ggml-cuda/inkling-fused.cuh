@@ -39,3 +39,9 @@ void ggml_cuda_op_loop_control_raw(ggml_backend_cuda_context & ctx, const ggml_t
 // MoE weight normalisation: dst[k, t] = w[k, t] / (sum_k w[k, t] * s + b) * out_scale
 void ggml_cuda_op_moe_weights_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * w, ggml_tensor * dst,
                                    float s, float b, float out_scale);
+
+// relative-position attention bias joined with the mask, F16 out:
+// dst[k, t, h] = f16((rel_pos[k, t] < n_extent ? <bias[:, rel_pos[k, t]], r[:, h, t]> : 0) - sinks[h, t] + mask[k, t])
+void ggml_cuda_op_rel_bias_mask(ggml_backend_cuda_context & ctx, const ggml_tensor * bias, const void * r,
+                                const ggml_tensor * sinks, const ggml_tensor * rel_pos, const ggml_tensor * mask, ggml_tensor * dst,
+                                void * scratch);

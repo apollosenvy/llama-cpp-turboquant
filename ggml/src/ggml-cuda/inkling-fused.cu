@@ -418,3 +418,48 @@ void ggml_cuda_op_moe_weights_norm(ggml_backend_cuda_context & ctx, const ggml_t
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3((n_tokens + 63) / 64, 1, 1), dim3(64, 1, 1), 0, ctx.stream());
     ggml_cuda_kernel_launch(moe_weights_norm_f32, lp, (const float *) w->data, (float *) dst->data, n_used, n_tokens, s, b, out_scale);
 }
+
+static __global__ void rel_bias_mask_f16(const float * bias, const float * r, const float * sinks, const int32_t * rel_pos,
+                                         const half * mask, half * dst, const int n_rel, const int n_extent,
+                                         const int64_t n_kv, const int64_t n_tokens, const int64_t n) {
+    ggml_cuda_pdl_lc();
+    const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    const int64_t k  = idx % n_kv;
+    const int64_t th = idx / n_kv;
+    const int64_t t  = th % n_tokens;
+    const int64_t h  = th / n_tokens;
+
+    ggml_cuda_pdl_sync();
+
+    const int32_t rp = rel_pos[t*n_kv + k];
+    float v = 0.0f;
+    if (rp >= 0 && rp < n_extent) {
+        const float * b  = bias + (int64_t) rp*n_rel;
+        const float * rv = r + (t*(n/(n_kv*n_tokens)) + h)*n_rel;
+        for (int j = 0; j < n_rel; ++j) {
+            v += b[j]*rv[j];
+        }
+    }
+    v = v - sinks[t*(n/(n_kv*n_tokens)) + h] + __half2float(mask[t*n_kv + k]);
+    dst[idx] = __float2half(v);
+}
+
+void ggml_cuda_op_rel_bias_mask(ggml_backend_cuda_context & ctx, const ggml_tensor * bias, const void * r,
+                                const ggml_tensor * sinks, const ggml_tensor * rel_pos, const ggml_tensor * mask, ggml_tensor * dst,
+                                void * scratch) {
+    const int     n_rel    = bias->ne[0];
+    const int     n_extent = bias->ne[1];
+    const int64_t n_kv     = dst->ne[0];
+    const int64_t n_tokens = dst->ne[1];
+    const int64_t n        = ggml_nelements(dst);
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3((n + 255) / 256, 1, 1), dim3(256, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(rel_bias_mask_f16, lp, (const float *) bias->data, (const float *) r, (const float *) sinks->data,
+        (const int32_t *) rel_pos->data, (const half *) mask->data, (half *) (scratch ? scratch : dst->data), n_rel, n_extent, n_kv, n_tokens, n);
+    if (scratch) {
+        // dst shares memory with an input the kernel reads; the kernel wrote to scratch instead
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, scratch, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, ctx.stream()));
+    }
+}

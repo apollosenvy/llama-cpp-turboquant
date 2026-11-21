@@ -4576,7 +4576,7 @@ static bool heph_uses_confined(const ggml_cgraph * cgraph, int first, int last) 
             return false;
         }
         int uses = 0;
-        for (int j = k + 1; j <= last; ++j) {
+        for (int j = k; j <= last; ++j) { // from k: ggml_cast points src[1] at the node itself
             for (int s = 0; s < GGML_MAX_SRC; ++s) {
                 uses += cgraph->nodes[j]->src[s] == n;
             }
@@ -4990,6 +4990,107 @@ static int ggml_cuda_try_fuse_moe_weights_norm(ggml_backend_cuda_context * cuda_
     return i_out - i;
 }
 
+// MUL_MAT(pad(bias), r) | MUL_MAT sinks (kept) | SUB CONT GET_ROWS CONT | CPY(mask to f32) ADD CPY(to f16)
+static int ggml_cuda_try_fuse_rel_bias_mask(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = heph_fuse_enabled("relbias");
+    ggml_tensor * table = cgraph->nodes[i];
+    if (!enabled || table->op != GGML_OP_MUL_MAT || table->src[0]->op != GGML_OP_PAD) {
+        return 0;
+    }
+    int idx[9] = { i };
+    static const enum ggml_op ops[9] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_SUB, GGML_OP_CONT, GGML_OP_GET_ROWS, GGML_OP_CONT,
+                                         GGML_OP_CPY, GGML_OP_ADD, GGML_OP_CPY };
+    for (int k = 1; k < 9; ++k) {
+        idx[k] = heph_next_real(cgraph, idx[k - 1] + 1);
+        if (idx[k] < 0 || cgraph->nodes[idx[k]]->op != ops[k]) {
+            return 0;
+        }
+    }
+    ggml_tensor * sinks = cgraph->nodes[idx[1]];
+    ggml_tensor * sub   = cgraph->nodes[idx[2]];
+    ggml_tensor * cont1 = cgraph->nodes[idx[3]];
+    ggml_tensor * rows  = cgraph->nodes[idx[4]];
+    ggml_tensor * cont2 = cgraph->nodes[idx[5]];
+    ggml_tensor * cast1 = cgraph->nodes[idx[6]];
+    ggml_tensor * add   = cgraph->nodes[idx[7]];
+    ggml_tensor * out   = cgraph->nodes[idx[8]];
+
+    const ggml_tensor * pad     = table->src[0];
+    const ggml_tensor * bias    = pad->src[0];
+    const ggml_tensor * r       = table->src[1];
+    const ggml_tensor * rel_pos = rows->src[1];
+    const ggml_tensor * mask    = cast1->src[0];
+
+    auto through = [](const ggml_tensor * t) { // strip reshapes, transposes and permutes
+        while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_PERMUTE)) {
+            t = t->src[0];
+        }
+        return t;
+    };
+    if (sub->src[0] != table || through(sub->src[1]) != sinks || through(cont1->src[0]) != sub || rows->src[0] != cont1 ||
+        through(cont2->src[0]) != rows || cast1->src[1] != cast1 || add->src[0] != cont2 || add->src[1] != cast1 ||
+        out->src[0] != add || out->src[1] != out) {
+        return 0;
+    }
+
+    const int64_t n_rel    = bias->ne[0];
+    const int64_t n_extent = bias->ne[1];
+    const int64_t n_head   = r->ne[1];
+    const int64_t n_tokens = r->ne[2];
+    const int64_t n_kv     = rel_pos->ne[0];
+    // pad must add exactly one zero row after the bias rows, which is the row every out-of-extent distance selects
+    if (!heph_f32c(bias) || bias->ne[2] != 1 || pad->ne[0] != n_rel || pad->ne[1] != n_extent + 1 || pad->ne[2] != 1 ||
+        !heph_f32c(r) || r->ne[0] != n_rel || r->ne[3] != 1 || !heph_f32c(sinks) || ggml_nelements(sinks) != n_head*n_tokens ||
+        sinks->ne[0] != n_head || rel_pos->type != GGML_TYPE_I32 || !ggml_is_contiguous(rel_pos) || rel_pos->ne[1] != n_tokens ||
+        mask->type != GGML_TYPE_F16 || !ggml_is_contiguous(mask) || mask->ne[0] != n_kv || mask->ne[1] != n_tokens ||
+        ggml_nelements(mask) != n_kv*n_tokens || cast1->type != GGML_TYPE_F32 ||
+        out->type != GGML_TYPE_F16 || !ggml_is_contiguous(out) || out->ne[0] != n_kv || out->ne[1] != n_tokens || out->ne[2] != n_head ||
+        out->ne[3] != 1 || table->ne[0] != n_extent + 1 || table->ne[1] != n_head || table->ne[2] != n_tokens) {
+        return 0;
+    }
+    if (heph_overlap(out, bias) || heph_overlap(out, rel_pos) || heph_overlap(out, mask)) {
+        return 0;
+    }
+    if (!heph_uses_confined(cgraph, i, idx[8])) {
+        return 0;
+    }
+    // Buffers of the nodes this fusion elides serve as scratch. A scratch must not overlap anything the kernel reads or writes.
+    auto pick_scratch = [&](size_t nbytes, const ggml_tensor * avoid) -> ggml_tensor * {
+        for (ggml_tensor * cand : { cont2, add, rows, cont1, sub, table }) {
+            if (cand != avoid && ggml_nbytes(cand) >= nbytes && !heph_overlap(cand, r) && !heph_overlap(cand, sinks) &&
+                !heph_overlap(cand, bias) && !heph_overlap(cand, rel_pos) && !heph_overlap(cand, mask) && !heph_overlap(cand, out) &&
+                (!avoid || !heph_overlap(cand, avoid))) {
+                return cand;
+            }
+        }
+        return nullptr;
+    };
+    // sinks is computed here, one node early. If the allocator put it on r (whose last graph use is the table), keep a copy of r.
+    ggml_tensor * r_copy = nullptr;
+    if (heph_overlap(sinks, r)) {
+        r_copy = pick_scratch(ggml_nbytes(r), nullptr);
+        if (!r_copy) {
+            return 0;
+        }
+    }
+    // r and sinks die inside the chain, so the allocator often gives their memory to out. Then the kernel writes to scratch.
+    ggml_tensor * target = nullptr;
+    if (heph_overlap(out, r) || heph_overlap(out, sinks)) {
+        target = pick_scratch(ggml_nbytes(out), r_copy);
+        if (!target) {
+            return 0;
+        }
+    }
+    if (r_copy) {
+        CUDA_CHECK(cudaMemcpyAsync(r_copy->data, r->data, ggml_nbytes(r), cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+    }
+    if (!ggml_cuda_compute_forward(*cuda_ctx, sinks)) {
+        GGML_ABORT("rel_bias fusion: sink projection failed");
+    }
+    ggml_cuda_op_rel_bias_mask(*cuda_ctx, bias, r_copy ? r_copy->data : r->data, sinks, rel_pos, mask, out, target ? target->data : nullptr);
+    return idx[8] - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -5005,6 +5106,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return n;
         }
         if (const int n = ggml_cuda_try_fuse_mix(cuda_ctx, cgraph, i)) {
+            ++ggml_cuda_heph_fuse_count;
+            return n;
+        }
+        if (const int n = ggml_cuda_try_fuse_rel_bias_mask(cuda_ctx, cgraph, i)) {
             ++ggml_cuda_heph_fuse_count;
             return n;
         }
