@@ -154,15 +154,28 @@ tests/inkling-fusetest/build.sh build && tests/inkling-fusetest/fusetest
 
 Known gaps:
 
-- Three full runs out of about 80 had one failing case, always `route_T5` (the router with five tokens) with the
-  same numbers; 300 runs of the router cases alone passed. In the captured failure the router's weights are right
-  and what the harness reads back afterwards (the ids copy, and a few elements of the logits buffer) is not. The
-  cause is open. `FUSEDIAG=<case>` prints the allocator layout and every mismatching element, `FUSEUNTIL=<case>`
-  stops after a case.
 - The tests cover the fused stages, not the whole model. End to end, recall of a code planted at the start
   of an 8K prompt is correct at 256K context.
 - Constants are for this card: thread counts, the slow grid sizes, the q8_1 cache slot size.
   Other GPUs are untested.
+
+## A runtime fault found on the way: hipGraphExecUpdate
+
+About one full test run in twenty failed the same case with the same wrong numbers, and never when that case ran
+alone. Cause: the backend keys captured device graphs by the address of a graph's first node, and re-captures over
+an existing executable with `cudaGraphExecUpdate`, rebuilding only if that reports failure. With ROCm 10.1,
+`hipGraphExecUpdate` sometimes returns `hipSuccess` for a graph whose node kinds differ from the executable's at one
+position (a memcpy node where the new graph has a kernel) and keeps the old node. Every later launch then runs the
+stale copy. For the same pair of graphs the call usually returns the failure code, which is why it was rare.
+`AMD_LOG_LEVEL=3 GGML_CUDA_GRAPH_DEBUG=1` shows both outcomes.
+
+llama.cpp builds every graph of a context in one buffer, so the same key is re-captured at each prefill/decode
+transition and each growth of the KV cache. This series always destroys and instantiates the executable on HIP
+(`GGML_CUDA_HIP_GRAPH_EXEC_UPDATE=1` restores the update). A 1,500-token decode runs at the same speed either way.
+The fault is in the path the unmodified backend uses too.
+
+The test harness kept what found it: `FUSEDIAG=<case>` prints the allocator layout and every mismatching element,
+`FUSEUNTIL=<case>` stops after a case, `FUSEFIXEDCTX=1` builds every graph at one address.
 
 ## Quality
 

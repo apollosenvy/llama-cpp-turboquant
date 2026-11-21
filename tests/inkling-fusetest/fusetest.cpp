@@ -42,6 +42,14 @@ static std::vector<bool> g_out_t3;  // which were turbo3 (compared after decodin
 
 static std::vector<std::vector<float>> run(ggml_backend_t backend, const builder & build, unsigned seed) {
     ggml_init_params ip = { ggml_tensor_overhead()*4096 + ggml_graph_overhead_custom(4096, false), nullptr, true };
+    // FUSEFIXEDCTX=1: every graph under test is built in the same memory, so its first node has the same address in
+    // every case. The backend keys its captured device graphs by that address, as llama.cpp's own graphs do (one
+    // compute buffer per context): this makes every case go through the reuse and update path of the one before it.
+    static std::vector<uint8_t> fixed_ctx;
+    if (g_test_side && getenv("FUSEFIXEDCTX")) {
+        fixed_ctx.resize(ip.mem_size);
+        ip.mem_buffer = fixed_ctx.data();
+    }
     ggml_context * ctx = ggml_init(ip);
     built b = build(ctx);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 4096, false);
