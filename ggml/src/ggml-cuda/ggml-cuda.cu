@@ -3446,6 +3446,21 @@ static void ggml_cuda_graph_update_executable(ggml_cuda_graph_instance & instanc
     GGML_UNUSED(device);
 #endif // USE_CUDA_GRAPH_CLUSTER_CHECK
 
+#if defined(GGML_USE_HIP)
+    // hipGraphExecUpdate (ROCm 10.1) can return success for a graph whose node kinds differ from the executable's at
+    // one position (a memcpy node where the new graph has a kernel), and then keeps the old node: every launch after
+    // that runs the stale copy. It does so intermittently for the same pair of graphs; most of the time it reports
+    // the failure and the executable is rebuilt below. Never update in place on HIP, always instantiate.
+    // GGML_CUDA_HIP_GRAPH_EXEC_UPDATE=1 goes back to updating.
+    static const bool hip_exec_update = getenv("GGML_CUDA_HIP_GRAPH_EXEC_UPDATE") != nullptr && atoi(getenv("GGML_CUDA_HIP_GRAPH_EXEC_UPDATE")) != 0;
+    if (!hip_exec_update) {
+        CUDA_CHECK(cudaGraphExecDestroy(instance));
+        instance.handle = nullptr;
+        CUDA_CHECK(cudaGraphInstantiate(&instance.handle, cuda_graph, nullptr, nullptr, 0));
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
+
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
     cudaError_t stat = cudaGraphExecUpdate(instance, cuda_graph, &result_info);
