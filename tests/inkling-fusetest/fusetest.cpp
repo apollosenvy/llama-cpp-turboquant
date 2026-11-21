@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <cstdint>
 #include <random>
 #include <string>
 #include <vector>
@@ -32,6 +33,7 @@ static ggml_tensor * inp(ggml_context * ctx, built & b, int64_t n0, int64_t n1 =
 }
 
 static double g_bench_us = 0.0;
+static bool g_stop = false;
 static std::string g_case; // name of the case being run
 static size_t g_repeat_bad = 0; // FUSEREPEAT: output reads that differed from the first evaluation
 static bool g_test_side = false; // true while building the graph under test, false for the reference graph
@@ -96,6 +98,19 @@ static std::vector<std::vector<float>> run(ggml_backend_t backend, const builder
         }
     }
     };
+    // FUSEDIAG=<case substring>: where the allocator put every node of the graph under test (offsets from the lowest
+    // address), to compare a failing run with a passing one
+    if (const char * dg = g_test_side ? getenv("FUSEDIAG") : nullptr; dg && g_case.find(dg) != std::string::npos) {
+        uintptr_t lo = UINTPTR_MAX;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) if (ggml_graph_node(gf, i)->data) lo = std::min(lo, (uintptr_t) ggml_graph_node(gf, i)->data);
+        for (ggml_tensor * t : b.inputs) if (t->data) lo = std::min(lo, (uintptr_t) t->data);
+        for (ggml_tensor * t : b.inputs) fprintf(stderr, "DIAG %s seed %u input  %-10s off %8zu bytes %7zu\n", g_case.c_str(), seed, t->name, (size_t) ((uintptr_t) t->data - lo), ggml_nbytes(t));
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            const ggml_tensor * t = ggml_graph_node(gf, i);
+            fprintf(stderr, "DIAG %s seed %u node %2d %-12s off %8zu bytes %7zu%s%s\n", g_case.c_str(), seed, i, ggml_op_name(t->op),
+                (size_t) ((uintptr_t) t->data - lo), ggml_nbytes(t), t->view_src ? " view" : "", (t->flags & GGML_TENSOR_FLAG_OUTPUT) ? " out" : "");
+        }
+    }
     for (unsigned pass = 0; pass < 2; ++pass) {
     set_inputs(pass);
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { fprintf(stderr, "compute failed\n"); exit(2); }
@@ -226,8 +241,10 @@ int main(int argc, char ** argv) {
     int fails = 0;
     for (const test_case & tc : cases()) {
         if (argc > 1 && tc.name.find(argv[1]) == std::string::npos) continue;
+        if (g_stop) break; // FUSEUNTIL=<case name>: stop after that case
         double worst = 0.0;
         g_case = tc.name;
+        if (const char * until = getenv("FUSEUNTIL"); until && tc.name == until) g_stop = true;
         const int fused_before = ggml_cuda_heph_fuse_count; // a reused device graph does not re-run the matcher, so count per case
         for (unsigned seed = 1; seed <= 3; ++seed) {
             g_test_side = true;
@@ -257,6 +274,15 @@ int main(int argc, char ** argv) {
                 // F16 outputs: a last-bit float difference can flip a whole half step (1e-3 relative), measured up to 2e-9.
                 // A 0.1 % kernel error gives 1e-6 either way.
                 const double nm = num/(den + 1e-30)*(g_out_f16[o] ? 0.1 : 1.0);
+                if (!(nm < tc.tol) && getenv("FUSEDIAG")) { // every element that is off, up to 96
+                    size_t shown = 0;
+                    for (size_t i = 0; i < g[o].size() && shown < 96; ++i) {
+                        if (std::fabs((double) g[o][i] - c[o][i]) > 1e-4*std::fabs(c[o][i]) + 1e-9) {
+                            fprintf(stderr, "DIAG %s seed %u output %zu [%zu] test %.9g ref %.9g\n", tc.name.c_str(), seed, o, i, g[o][i], c[o][i]);
+                            ++shown;
+                        }
+                    }
+                }
                 if (!(nm < tc.tol)) { // say where: which output, and the first element that is off
                     size_t first = 0;
                     while (first < g[o].size() && std::fabs((double) g[o][first] - c[o][first]) <= 1e-4*std::fabs(c[o][first]) + 1e-9) ++first;

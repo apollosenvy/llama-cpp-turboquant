@@ -6,8 +6,8 @@ RX 7900 XTX, with the same GGUF and the same sampling. It is built on llama.cpp 
 
 | | Before | After |
 |---|---|---|
-| Decode, empty context | 29 tok/s | 100 tok/s |
-| Decode at 20K context | | 90 tok/s |
+| Decode, empty context | 29 tok/s | 103 tok/s |
+| Decode at 33K context | | 94 tok/s |
 | Decode at about 100K context | 23.5 tok/s (90K) | 80 tok/s (104K) |
 | Prefill, 8K prompt, 256K context | about 140 tok/s | 1,040 tok/s |
 | Prefill, 104K prompt | about 130 tok/s | 727 tok/s |
@@ -96,6 +96,11 @@ through LDS. For xor masks 1, 2, 4 and 8 the two lanes sit in the same row of 16
 registers. Same lanes, same results (every test output is bit-identical), and every reduction in the backend gets
 cheaper: 99.5 to 100.6 tok/s.
 
+**Lone Q8_0 matvecs on the grouped kernel.** The 3072 x 2304 output projection and lm_head went through the generic
+matvec kernel at 75% and 79% of the card's bandwidth. The grouped-projection kernel with a single job computes the
+same partial sums in the same order, so the result is bit-identical, and it is faster for both: 100.2 to 103.2
+tok/s. `GGML_CUDA_HEPH_MMV1_ROWS=<min rows>` moves the limit (default 1024), 0 keeps them on the generic kernel.
+
 ## Build and run
 
 ```bash
@@ -149,8 +154,11 @@ tests/inkling-fusetest/build.sh build && tests/inkling-fusetest/fusetest
 
 Known gaps:
 
-- Two full runs out of about 55 had one failing case that did not reproduce, including under 14
-  instrumented runs. The cause is unknown.
+- Three full runs out of about 80 had one failing case, always `route_T5` (the router with five tokens) with the
+  same numbers; 300 runs of the router cases alone passed. In the captured failure the router's weights are right
+  and what the harness reads back afterwards (the ids copy, and a few elements of the logits buffer) is not. The
+  cause is open. `FUSEDIAG=<case>` prints the allocator layout and every mismatching element, `FUSEUNTIL=<case>`
+  stops after a case.
 - The tests cover the fused stages, not the whole model. End to end, recall of a code planted at the start
   of an 8K prompt is correct at 256K context.
 - Constants are for this card: thread counts, the slow grid sizes, the q8_1 cache slot size.
@@ -176,7 +184,7 @@ scored perplexity 88; the speed benchmarks looked normal.
 
 ## What is left
 
-Weight reads are 5.6 ms of the 9.9 ms per token (the two control kernels read 7 MB of weights per layer pass and
+Weight reads are 5.4 ms of the 9.7 ms per token (the two control kernels read 7 MB of weights per layer pass and
 count here) and run at about 80% of peak bandwidth while active. Small kernels are 2.2 ms and the gaps between
 launches 2.1 ms: every dispatch of the replayed graph waits for the one before it. At long context, decode pays
 about 1.4 ms per token per 100K tokens in the attention kernel. For batches, the tile attention kernel converts
