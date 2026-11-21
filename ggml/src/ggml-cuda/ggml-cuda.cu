@@ -51,6 +51,7 @@
 #include "ggml-cuda/sleep.cuh"
 #include "ggml-cuda/snake.cuh"
 #include "ggml-cuda/softcap.cuh"
+#include "ggml-cuda/inkling-fused.cuh"
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
@@ -4465,6 +4466,106 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// ---- HEPH: glue-chain fusions for op-heavy decode graphs (Inkling 2) ----
+
+static bool heph_fuse_enabled(const char * name) {
+    // GGML_CUDA_HEPH_FUSE=0 disables all; GGML_CUDA_HEPH_NOFUSE=clip,mix,... disables by name
+    static const char * all = getenv("GGML_CUDA_HEPH_FUSE");
+    static const char * off = getenv("GGML_CUDA_HEPH_NOFUSE");
+    if (all && all[0] == '0') {
+        return false;
+    }
+    return !(off && strstr(off, name));
+}
+
+static bool heph_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+
+// x' = scale ? x*scale : x;  dst = x' * clamp(thr / (sqrt(sum_rows(x'^2)) + eps), 0, 1)
+// [MUL] SQR SUM_ROWS SQRT SCALE FILL DIV CLAMP MUL
+static int ggml_cuda_try_fuse_clip_rows(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = heph_fuse_enabled("clip");
+    if (!enabled) {
+        return 0;
+    }
+
+    ggml_tensor * head = cgraph->nodes[i];
+    const bool has_scale = head->op == GGML_OP_MUL;
+    if (!has_scale && head->op != GGML_OP_SQR) {
+        return 0;
+    }
+
+    const int b     = has_scale ? i + 1 : i;
+    const int count = b + 8 - i;
+    if (b + 8 > cgraph->n_nodes) {
+        return 0;
+    }
+
+    static const enum ggml_op chain[9] = { GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE,
+                                           GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL };
+    const enum ggml_op * ops = has_scale ? chain : chain + 1;
+
+    int idxs[9];
+    for (int k = 0; k < count; ++k) {
+        idxs[k] = i + k;
+        if (cgraph->nodes[i + k]->op != ops[k]) {
+            return 0;
+        }
+    }
+    const int out = b + 7;
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, &out, 1)) {
+        return 0;
+    }
+
+    ggml_tensor * sqr   = cgraph->nodes[b];
+    ggml_tensor * sum   = cgraph->nodes[b + 1];
+    ggml_tensor * sqrt_ = cgraph->nodes[b + 2];
+    ggml_tensor * sc    = cgraph->nodes[b + 3];
+    ggml_tensor * fill  = cgraph->nodes[b + 4];
+    ggml_tensor * div   = cgraph->nodes[b + 5];
+    ggml_tensor * clamp = cgraph->nodes[b + 6];
+    ggml_tensor * mul   = cgraph->nodes[b + 7];
+
+    const ggml_tensor * xs    = sqr->src[0]; // the (scaled) input
+    const ggml_tensor * x     = has_scale ? head->src[0] : xs;
+    const ggml_tensor * scale = has_scale ? head->src[1] : nullptr;
+
+    if ((has_scale && xs != head) || sum->src[0] != sqr || sqrt_->src[0] != sum || sc->src[0] != sqrt_ || fill->src[0] != sc ||
+        div->src[0] != fill || div->src[1] != sc || clamp->src[0] != div ||
+        !((mul->src[0] == xs && mul->src[1] == clamp) || (mul->src[1] == xs && mul->src[0] == clamp))) {
+        return 0;
+    }
+
+    if (x->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_is_contiguous(mul) ||
+        !ggml_are_same_shape(x, mul) || x->ne[3] != 1 || sum->ne[0] != 1 || sum->ne[1] != x->ne[1] || sum->ne[2] != x->ne[2]) {
+        return 0;
+    }
+    if (scale) {
+        const bool prefix_ok = (scale->ne[1] == x->ne[1] || (scale->ne[1] == 1 && scale->ne[2] == 1)) &&
+                               (scale->ne[2] == x->ne[2] || scale->ne[2] == 1) && scale->ne[3] == 1;
+        if (scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) || scale->ne[0] != x->ne[0] || !prefix_ok) {
+            return 0;
+        }
+        if (heph_overlap(mul, scale)) {
+            return 0;
+        }
+    }
+    // each thread re-reads x[col] right before writing dst[col], so an exact alias is fine, a shifted one is not
+    if (heph_overlap(mul, x) && mul->data != x->data) {
+        return 0;
+    }
+
+    if (ggml_get_op_params_f32(sc, 0) != 1.0f || ggml_get_op_params_f32(clamp, 0) != 0.0f || ggml_get_op_params_f32(clamp, 1) != 1.0f) {
+        return 0;
+    }
+
+    ggml_cuda_op_clip_rows(*cuda_ctx, x, scale, mul, ggml_get_op_params_f32(fill, 0), ggml_get_op_params_f32(sc, 1), 1.0f);
+    return count - 1;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4473,6 +4574,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (cuda_ctx->stream_context().concurrent_events.empty()) {
+        if (const int n = ggml_cuda_try_fuse_clip_rows(cuda_ctx, cgraph, i)) {
+            return n;
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
@@ -5466,8 +5573,26 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // HEPH-DEBUG: GGML_CUDA_DUMP_NODES=1 prints every evaluated node once per captured graph
+                static const bool dump_nodes = getenv("GGML_CUDA_DUMP_NODES") != nullptr;
+                const auto dump_node = [&](int idx, const char * tag) {
+                    const ggml_tensor * t = cgraph->nodes[idx];
+                    char srcs[256] = ""; int off = 0;
+                    for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) {
+                        int si = -1;
+                        for (int k = idx - 1; k >= 0 && k >= idx - 400; --k) { if (cgraph->nodes[k] == t->src[s]) { si = k; break; } }
+                        off += snprintf(srcs + off, sizeof(srcs) - off, " %d:%s[%lld,%lld,%lld]%s", si, ggml_type_name(t->src[s]->type),
+                            (long long) t->src[s]->ne[0], (long long) t->src[s]->ne[1], (long long) t->src[s]->ne[2], ggml_is_contiguous(t->src[s]) ? "" : "!c");
+                        if (off > 200) break;
+                    }
+                    fprintf(stderr, "DUMPNODE %d %s %s%s '%s' [%lld,%lld,%lld,%lld] uses=%d src:%s\n", idx, tag, ggml_op_name(t->op),
+                        t->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(t)) : "", t->name,
+                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                        (int) ggml_node_get_use_count(cgraph, idx), srcs);
+                };
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
+                if (dump_nodes) { dump_node(i, nodes_to_skip ? "FUSEHEAD" : "single"); for (int k = 1; k <= nodes_to_skip; ++k) dump_node(i + k, "fused"); }
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
