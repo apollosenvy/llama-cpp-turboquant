@@ -421,35 +421,52 @@ void ggml_cuda_op_loop_control(ggml_backend_cuda_context & ctx, const ggml_tenso
     }
 }
 
-static __global__ void situ_f32(const char * g, const char * u, float * dst, const int n0, const int64_t n,
+static __global__ void situ_f32(const char * g, const char * u, float * dst, const int n0, const int n0_pad, const int64_t n,
                                 const int64_t g_nb0, const int64_t g_nb1, const int64_t u_nb0, const int64_t u_nb1,
-                                const float inv_beta, const float beta, const float inv_lb, const float lb) {
+                                const float inv_beta, const float beta, const float inv_lb, const float lb, block_q8_1 * q) {
     ggml_cuda_pdl_lc();
+    // rows of n0_pad positions, the last n0_pad - n0 of each are padding (zero q8_1 blocks, nothing else)
     const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
     if (idx >= n) {
         return;
     }
-    const int64_t i0 = idx % n0;
-    const int64_t i1 = idx / n0;
+    const int64_t i0 = idx % n0_pad;
+    const int64_t i1 = idx / n0_pad;
 
     ggml_cuda_pdl_sync();
 
-    const float gv = *(const float *) (g + i0*g_nb0 + i1*g_nb1);
-    const float uv = *(const float *) (u + i0*u_nb0 + i1*u_nb1);
+    float v = 0.0f;
+    if (i0 < n0) {
+        const float gv = *(const float *) (g + i0*g_nb0 + i1*g_nb1);
+        const float uv = *(const float *) (u + i0*u_nb0 + i1*u_nb1);
 
-    // same association as the unfused chain: ((tanh(g/beta)*beta) * sigmoid(g)) * (tanh(u/lb)*lb)
-    const float act = (tanhf(gv*inv_beta)*beta) * (1.0f / (1.0f + expf(-gv)));
-    dst[idx] = act * (tanhf(uv*inv_lb)*lb);
+        // same association as the unfused chain: ((tanh(g/beta)*beta) * sigmoid(g)) * (tanh(u/lb)*lb)
+        const float act = (tanhf(gv*inv_beta)*beta) * (1.0f / (1.0f + expf(-gv)));
+        v = act * (tanhf(uv*inv_lb)*lb);
+        dst[i1*n0 + i0] = v;
+    }
+    if (q) { // as quantize_q8_1: a warp is one block of 32 (n0_pad is a multiple of 32, the thread block of 256)
+        const float  amax = warp_reduce_max<QK8_1>(fabsf(v));
+        const float  d    = amax / 127.0f;
+        const int8_t qv   = amax == 0.0f ? 0 : roundf(v / d);
+        const int    sum  = warp_reduce_sum<QK8_1>((int) qv);
+        block_q8_1 * blk  = q + idx / QK8_1;
+        blk->qs[idx % QK8_1] = qv;
+        if (idx % QK8_1 == 0) {
+            blk->ds = make_half2(d, d * sum);
+        }
+    }
 }
 
 void ggml_cuda_op_situ(ggml_backend_cuda_context & ctx, const ggml_tensor * g, const ggml_tensor * u, ggml_tensor * dst,
-                       float inv_beta, float beta, float inv_lb, float lb) {
-    const int64_t n  = ggml_nelements(dst);
-    const int     n0 = dst->ne[0];
+                       float inv_beta, float beta, float inv_lb, float lb, void * q8_1) {
+    const int     n0     = dst->ne[0];
+    const int     n0_pad = q8_1 ? GGML_PAD(n0, MATRIX_ROW_PADDING) : n0;
+    const int64_t n      = ggml_nelements(dst) / n0 * n0_pad;
     // rows beyond ne[1] fold into the nb[1] stride only when the higher dims are contiguous in nb[1] steps
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3((n + 255) / 256, 1, 1), dim3(256, 1, 1), 0, ctx.stream());
-    ggml_cuda_kernel_launch(situ_f32, lp, (const char *) g->data, (const char *) u->data, (float *) dst->data, n0, n,
-        (int64_t) g->nb[0], (int64_t) g->nb[1], (int64_t) u->nb[0], (int64_t) u->nb[1], inv_beta, beta, inv_lb, lb);
+    ggml_cuda_kernel_launch(situ_f32, lp, (const char *) g->data, (const char *) u->data, (float *) dst->data, n0, n0_pad, n,
+        (int64_t) g->nb[0], (int64_t) g->nb[1], (int64_t) u->nb[0], (int64_t) u->nb[1], inv_beta, beta, inv_lb, lb, (block_q8_1 *) q8_1);
 }
 
 static __global__ void conv_res_scale_f32(const float * x, const float * w, const float * cur, float * dst,

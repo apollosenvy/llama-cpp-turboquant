@@ -1557,19 +1557,24 @@ static bool heph_qcache_enabled() {
 // Only computed, non-view tensors: those are written once, by their own node, and a tensor with pending consumers keeps
 // its buffer untouched. The cache is dropped at the start of every evaluation.
 // quantize: launch the quantize kernel on a miss. Otherwise the caller writes the q8_1 data itself.
-const char * ggml_cuda_heph_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, bool quantize, bool * hit) {
+const char * ggml_cuda_heph_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, bool quantize, bool * hit, bool find_only) {
     using cache = ggml_backend_cuda_context::heph_q8_cache;
     const int64_t ne10        = src1->ne[0];
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    const size_t  q8_1_size   = ne10_padded * sizeof(block_q8_1)/QK8_1;
+    // a few vectors of one tensor (the per-expert inputs of the MoE down projection) share a slot, row after padded row
+    const int64_t rows        = ggml_nelements(src1) / ne10;
+    const size_t  q8_1_size   = rows*ne10_padded * sizeof(block_q8_1)/QK8_1;
     if (hit) {
         *hit = false;
     }
+    if (rows < 1 || rows*ne10 != ggml_nelements(src1) || (rows > 1 && (quantize || src1->ne[1] != rows))) {
+        return nullptr;
+    }
     // a reshape of a whole tensor stands for that tensor
-    if (src1->view_src != nullptr && src1->view_offs == 0 && src1->data == src1->view_src->data && ggml_nelements(src1->view_src) == ne10) {
+    if (rows == 1 && src1->view_src != nullptr && src1->view_offs == 0 && src1->data == src1->view_src->data && ggml_nelements(src1->view_src) == ne10) {
         src1 = src1->view_src;
     }
-    if (!heph_qcache_enabled() || src1->type != GGML_TYPE_F32 || ggml_nelements(src1) != ne10 || q8_1_size > cache::slot_bytes ||
+    if (!heph_qcache_enabled() || src1->type != GGML_TYPE_F32 || q8_1_size > cache::slot_bytes ||
         src1->op == GGML_OP_NONE || src1->view_src != nullptr || !ggml_is_contiguous(src1)) {
         return nullptr;
     }
@@ -1586,6 +1591,9 @@ const char * ggml_cuda_heph_q8_1(ggml_backend_cuda_context & ctx, const ggml_ten
             }
             return qc.buf + s*cache::slot_bytes;
         }
+    }
+    if (find_only) {
+        return nullptr;
     }
     const int s = qc.next;
     qc.next = (qc.next + 1) % cache::n_slots;
@@ -1809,7 +1817,8 @@ void ggml_cuda_mul_mat_vec_q(
     const size_t  q8_1_size   = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
     // HEPH: one vector read by several matvecs (Q, relative bias, sinks and gate share their input) is quantized once
-    const char * src1_q = ne11 == 1 && ne12 == 1 && ne13 == 1 ? ggml_cuda_heph_q8_1(ctx, src1, true) : nullptr;
+    // a single vector is quantized into the cache; several vectors are used from it only if their producer put them there
+    const char * src1_q = ne12 == 1 && ne13 == 1 ? ggml_cuda_heph_q8_1(ctx, src1, ne11 == 1, nullptr, ne11 != 1) : nullptr;
     if (src1_q == nullptr) {
         src1_q8_1.alloc(q8_1_size);
         const int64_t s11 = src1->nb[1] / ts_src1;

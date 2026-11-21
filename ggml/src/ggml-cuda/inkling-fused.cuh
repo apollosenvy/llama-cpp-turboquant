@@ -23,8 +23,9 @@ void ggml_cuda_op_loop_control(ggml_backend_cuda_context & ctx, const ggml_tenso
                                const ggml_tensor * cur, const ggml_tensor * msg, ggml_tensor * gate_tmp, ggml_tensor * dst);
 
 // situ(): dst = beta*tanh(g/beta)*sigmoid(g) * lb*tanh(u/lb), g and u are strided 2D views
+// q8_1: optional, receives the q8_1 form of dst, each row padded as quantize_row_q8_1 lays it out
 void ggml_cuda_op_situ(ggml_backend_cuda_context & ctx, const ggml_tensor * g, const ggml_tensor * u, ggml_tensor * dst,
-                       float inv_beta, float beta, float inv_lb, float lb);
+                       float inv_beta, float beta, float inv_lb, float lb, void * q8_1 = nullptr);
 
 // convolve() tail: dst[c, i] = (cur[c, i] + sum_j x[i + j, c]*w[j, c]) * scale
 void ggml_cuda_op_conv_res_scale(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w,
@@ -80,7 +81,9 @@ void ggml_cuda_op_rot_rows(ggml_backend_cuda_context & ctx, const heph_rot_args 
 
 // q8_1 copy of a single F32 vector in the backend's small cache, or nullptr if the tensor does not qualify.
 // quantize: launch the quantize kernel on a miss (otherwise the caller writes the slot). hit: optional, set on a cache hit.
-const char * ggml_cuda_heph_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, bool quantize, bool * hit = nullptr);
+// find_only: no slot is taken on a miss. A tensor of several rows qualifies only with quantize false (its producer writes it).
+const char * ggml_cuda_heph_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, bool quantize, bool * hit = nullptr,
+                                 bool find_only = false);
 
 // several Q8_0 matrix x vector products (MUL_MAT nodes) in one launch
 void ggml_cuda_op_mmv_q8_0_multi(ggml_backend_cuda_context & ctx, ggml_tensor ** nodes, int n);

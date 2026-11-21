@@ -4862,8 +4862,13 @@ static int ggml_cuda_try_fuse_situ(ggml_backend_cuda_context * cuda_ctx, ggml_cg
     if (!heph_uses_confined(cgraph, i, idx[8])) {
         return 0;
     }
+    // a few expert rows for one token: also hand the down projection its quantized input
+    void * q8 = nullptr;
+    if (out->ne[2] == 1 && out->ne[3] == 1 && out->ne[1] <= 8) {
+        q8 = (void *) ggml_cuda_heph_q8_1(*cuda_ctx, out, false);
+    }
     ggml_cuda_op_situ(*cuda_ctx, g, u, out, ggml_get_op_params_f32(s0, 0), ggml_get_op_params_f32(s1, 0),
-        ggml_get_op_params_f32(s2, 0), ggml_get_op_params_f32(s3, 0));
+        ggml_get_op_params_f32(s2, 0), ggml_get_op_params_f32(s3, 0), q8);
     return idx[8] - i;
 }
 
